@@ -1,7 +1,10 @@
+mod cache;
 mod cargo;
 mod languages;
+mod mcp;
 mod schema;
 
+use crate::cache::{Cache, parallel_index};
 use crate::cargo::{RegistryCrate, find_crate, list_registry_crates, resolve_project_deps};
 use crate::languages::rust::RustParser;
 use crate::schema::{Item, PackageItems};
@@ -45,6 +48,10 @@ enum Commands {
         /// Show full details including methods and fields
         #[arg(short, long)]
         full: bool,
+
+        /// Skip cache, parse fresh
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Search for a symbol across dependencies
@@ -55,6 +62,10 @@ enum Commands {
         /// Only search in project dependencies (requires Cargo.lock)
         #[arg(short, long)]
         project: bool,
+
+        /// Skip cache, parse fresh (slow)
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Show the source path for a crate
@@ -72,6 +83,31 @@ enum Commands {
         #[arg(short, long, default_value = "crate")]
         module: String,
     },
+
+    /// Manage the local cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
+    /// Start MCP server for AI assistant integration (stdio transport)
+    Mcp,
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Build/update cache for project dependencies
+    Build {
+        /// Re-index even if already cached
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Show cache statistics
+    Stats,
+    /// Clear all cached data
+    Clear,
+    /// List all indexed crates
+    List,
 }
 
 fn main() {
@@ -80,10 +116,19 @@ fn main() {
     let result = match cli.command {
         Commands::List { filter, latest } => cmd_list(filter, latest),
         Commands::Deps { path } => cmd_deps(path),
-        Commands::Peek { name, full } => cmd_peek(&name, full),
-        Commands::Find { query, project } => cmd_find(&query, project),
+        Commands::Peek { name, full, no_cache } => cmd_peek(&name, full, no_cache),
+        Commands::Find { query, project, no_cache } => cmd_find(&query, project, no_cache),
         Commands::Where { name } => cmd_where(&name),
         Commands::Parse { file, module } => cmd_parse(&file, &module),
+        Commands::Cache { action } => match action {
+            CacheAction::Build { force } => cmd_cache_build(force),
+            CacheAction::Stats => cmd_cache_stats(),
+            CacheAction::Clear => cmd_cache_clear(),
+            CacheAction::List => cmd_cache_list(),
+        },
+        Commands::Mcp => {
+            std::process::exit(mcp::cmd_mcp());
+        }
     };
 
     if let Err(e) = result {
@@ -137,10 +182,30 @@ fn cmd_deps(path: Option<Utf8PathBuf>) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn cmd_peek(name: &str, full: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_peek(name: &str, full: bool, no_cache: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (crate_name, version) = parse_crate_spec(name);
-    let krate = find_specific_crate(crate_name, version)?;
 
+    // Try cache first
+    if !no_cache && Cache::exists() {
+        if let Ok(cache) = Cache::open_existing() {
+            let items = cache.search_crate(crate_name, version)?;
+            if !items.is_empty() {
+                eprintln!("(from cache)");
+                for item in &items {
+                    if let Some(sig) = &item.signature {
+                        println!("{} ({}) - {}", item.path, item.kind, sig);
+                    } else {
+                        println!("{} ({})", item.path, item.kind);
+                    }
+                }
+                eprintln!("\n{} items found", items.len());
+                return Ok(());
+            }
+        }
+    }
+
+    // Fall back to parsing
+    let krate = find_specific_crate(crate_name, version)?;
     eprintln!("Parsing {}@{} ...", krate.name, krate.version);
 
     let mut parser = RustParser::new()?;
@@ -181,7 +246,38 @@ fn cmd_peek(name: &str, full: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_find(query: &str, project_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_find(query: &str, project_only: bool, no_cache: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Try cache first
+    if !no_cache && Cache::exists() {
+        if let Ok(cache) = Cache::open_existing() {
+            let results = cache.search(query)?;
+            if !results.is_empty() {
+                // If project_only, filter to project deps
+                let results = if project_only {
+                    let deps = resolve_project_deps(&Utf8PathBuf::from("."))?;
+                    let dep_set: std::collections::HashSet<_> = deps
+                        .iter()
+                        .map(|d| (d.name.as_str(), d.version.as_str()))
+                        .collect();
+                    results
+                        .into_iter()
+                        .filter(|r| dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str())))
+                        .collect()
+                } else {
+                    results
+                };
+
+                eprintln!("(from cache)");
+                for r in &results {
+                    println!("{}@{}: {} ({})", r.crate_name, r.crate_version, r.path, r.kind);
+                }
+                eprintln!("\n{} matches found", results.len());
+                return Ok(());
+            }
+        }
+    }
+
+    // Fall back to parsing
     let crates = if project_only {
         resolve_project_deps(&Utf8PathBuf::from("."))?
     } else {
@@ -239,6 +335,51 @@ fn cmd_parse(file: &Utf8PathBuf, module: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+// === Cache commands ===
+
+fn cmd_cache_build(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let deps = resolve_project_deps(&Utf8PathBuf::from("."))?;
+    eprintln!("Found {} dependencies", deps.len());
+
+    let stats = parallel_index(&deps, force).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+
+    eprintln!(
+        "\nDone! Indexed {} crates ({} items), skipped {}, failed {}",
+        stats.indexed, stats.total_items, stats.skipped, stats.failed
+    );
+    Ok(())
+}
+
+fn cmd_cache_stats() -> Result<(), Box<dyn std::error::Error>> {
+    let cache = Cache::open_existing()?;
+    let stats = cache.stats()?;
+
+    println!("Crates indexed: {}", stats.crate_count);
+    println!("Items indexed:  {}", stats.item_count);
+    println!("Database size:  {:.2} MB", stats.db_size_bytes as f64 / 1_000_000.0);
+
+    Ok(())
+}
+
+fn cmd_cache_clear() -> Result<(), Box<dyn std::error::Error>> {
+    let cache = Cache::open()?;
+    cache.clear()?;
+    eprintln!("Cache cleared");
+    Ok(())
+}
+
+fn cmd_cache_list() -> Result<(), Box<dyn std::error::Error>> {
+    let cache = Cache::open_existing()?;
+    let crates = cache.list_indexed()?;
+
+    for (name, version) in &crates {
+        println!("{}@{}", name, version);
+    }
+
+    eprintln!("\n{} crates indexed", crates.len());
+    Ok(())
+}
+
 // === Helpers ===
 
 /// Parse "crate@version" or just "crate".
@@ -277,7 +418,7 @@ fn find_specific_crate(
 
 /// Convert a file path to a module path.
 /// e.g., "src/ser/mod.rs" -> "serde::ser"
-fn path_to_module(crate_name: &str, path: &camino::Utf8Path) -> String {
+pub fn path_to_module(crate_name: &str, path: &camino::Utf8Path) -> String {
     let path_str = path.as_str();
 
     // Strip src/ prefix
