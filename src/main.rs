@@ -304,7 +304,9 @@ fn cmd_find(
         }
     }
 
-    // Fall back to parsing
+    // Fall back to parallel parsing using rayon
+    use rayon::prelude::*;
+
     let crates = if project_only {
         resolve_project_deps(&Utf8PathBuf::from("."))?
     } else {
@@ -312,31 +314,47 @@ fn cmd_find(
     };
 
     let query_lower = query.to_lowercase();
-    let mut parser = RustParser::new()?;
-    let mut found = 0;
 
-    for krate in crates {
-        for source_file in krate.source_files() {
-            let relative = source_file
-                .strip_prefix(&krate.path)
-                .unwrap_or(&source_file);
-            let module_path = path_to_module(&krate.name, relative);
+    eprintln!("Searching {} crates (no cache)...", crates.len());
 
-            if let Ok(source) = fs::read_to_string(&source_file) {
-                if let Ok(items) = parser.parse_source(&source, &module_path) {
-                    for item in items {
-                        if item.path.to_lowercase().contains(&query_lower) {
-                            let kind = format!("{:?}", item.kind).to_lowercase();
-                            println!("{}@{}: {} ({})", krate.name, krate.version, item.path, kind);
-                            found += 1;
+    // Parse crates in parallel and collect matches
+    let matches: Vec<(String, String, String, String)> = crates
+        .par_iter()
+        .flat_map(|krate| {
+            let mut results = Vec::new();
+            if let Ok(mut parser) = RustParser::new() {
+                for source_file in krate.source_files() {
+                    let relative = source_file
+                        .strip_prefix(&krate.path)
+                        .unwrap_or(&source_file);
+                    let module_path = path_to_module(&krate.name, relative);
+
+                    if let Ok(source) = fs::read_to_string(&source_file) {
+                        if let Ok(items) = parser.parse_source(&source, &module_path) {
+                            for item in items {
+                                if item.path.to_lowercase().contains(&query_lower) {
+                                    let kind = format!("{:?}", item.kind).to_lowercase();
+                                    results.push((
+                                        krate.name.clone(),
+                                        krate.version.clone(),
+                                        item.path,
+                                        kind,
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
+            results
+        })
+        .collect();
+
+    for (name, version, path, kind) in &matches {
+        println!("{}@{}: {} ({})", name, version, path, kind);
     }
 
-    eprintln!("\n{} matches found", found);
+    eprintln!("\n{} matches found", matches.len());
     Ok(())
 }
 
