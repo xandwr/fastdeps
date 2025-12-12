@@ -6,7 +6,7 @@ mod npm;
 mod schema;
 
 use crate::cache::{Cache, parallel_index};
-use crate::cargo::{RegistryCrate, find_crate, list_registry_crates, resolve_project_deps};
+use crate::cargo::{RegistryCrate, find_crate, resolve_project_deps};
 use crate::languages::rust::RustParser;
 use crate::languages::typescript::{TsLanguage, TypeScriptParser};
 use crate::npm::parse_package_json;
@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List dependencies (project deps by default, --all for full registry)
+    /// List project dependencies
     List {
         /// Filter by crate name (substring match)
         #[arg(short, long)]
@@ -34,10 +34,6 @@ enum Commands {
         /// Show only the latest version of each crate
         #[arg(short = 'L', long)]
         latest: bool,
-
-        /// List ALL crates in cargo registry (not just project deps)
-        #[arg(short, long)]
-        all: bool,
     },
 
     /// List dependencies of the current project
@@ -65,14 +61,10 @@ enum Commands {
         project: Option<Utf8PathBuf>,
     },
 
-    /// Search for a symbol across dependencies
+    /// Search for a symbol across project dependencies
     Find {
         /// Symbol to search for (e.g., "Serialize", "spawn")
         query: String,
-
-        /// Search ALL registry crates (not just project deps)
-        #[arg(short, long)]
-        all: bool,
 
         /// Skip cache, parse fresh (slow)
         #[arg(long)]
@@ -146,11 +138,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::List {
-            filter,
-            latest,
-            all,
-        } => cmd_list(filter, latest, all),
+        Commands::List { filter, latest } => cmd_list(filter, latest),
         Commands::Deps { path } => cmd_deps(path),
         Commands::Peek {
             name,
@@ -158,11 +146,7 @@ fn main() {
             no_cache,
             project,
         } => cmd_peek(&name, full, no_cache, project),
-        Commands::Find {
-            query,
-            all,
-            no_cache,
-        } => cmd_find(&query, all, no_cache),
+        Commands::Find { query, no_cache } => cmd_find(&query, no_cache),
         Commands::Where { name } => cmd_where(&name),
         Commands::Parse { file, module } => cmd_parse(&file, &module),
         Commands::ParseTs { file, module } => cmd_parse_ts(&file, &module),
@@ -184,47 +168,36 @@ fn main() {
     }
 }
 
-fn cmd_list(
-    filter: Option<String>,
-    latest: bool,
-    all: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut crates = if all {
-        // List all crates in the cargo registry
-        list_registry_crates()?
-    } else {
-        // Default: list only project dependencies
-        // Try Rust first (Cargo.lock), then TypeScript (package.json)
-        let project_dir = Utf8PathBuf::from(".");
-        match resolve_project_deps(&project_dir) {
-            Ok(deps) => deps,
-            Err(_) => {
-                // Try npm/TypeScript
-                match npm::get_project_deps(&project_dir) {
-                    Ok(npm_deps) => {
-                        // Convert to display format and print directly
-                        let mut deps: Vec<_> = npm_deps
-                            .iter()
-                            .map(|d| (d.name.clone(), d.version.clone()))
-                            .collect();
+fn cmd_list(filter: Option<String>, latest: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Only list project dependencies - try Rust first (Cargo.lock), then TypeScript (package.json)
+    let project_dir = Utf8PathBuf::from(".");
+    let mut crates = match resolve_project_deps(&project_dir) {
+        Ok(deps) => deps,
+        Err(_) => {
+            // Try npm/TypeScript
+            match npm::get_project_deps(&project_dir) {
+                Ok(npm_deps) => {
+                    // Convert to display format and print directly
+                    let mut deps: Vec<_> = npm_deps
+                        .iter()
+                        .map(|d| (d.name.clone(), d.version.clone()))
+                        .collect();
 
-                        if let Some(ref f) = filter {
-                            deps.retain(|(name, _)| name.contains(f));
-                        }
+                    if let Some(ref f) = filter {
+                        deps.retain(|(name, _)| name.contains(f));
+                    }
 
-                        deps.sort();
-                        for (name, version) in &deps {
-                            println!("{}@{}", name, version);
-                        }
-                        eprintln!("\n{} dependencies found", deps.len());
-                        return Ok(());
+                    deps.sort();
+                    for (name, version) in &deps {
+                        println!("{}@{}", name, version);
                     }
-                    Err(_) => {
-                        eprintln!(
-                            "No Cargo.lock or package.json found. Use --all to list all registry crates."
-                        );
-                        return Ok(());
-                    }
+                    eprintln!("\n{} dependencies found", deps.len());
+                    return Ok(());
+                }
+                Err(_) => {
+                    return Err(
+                        "No supported project found. Requires Cargo.lock (Rust) or package.json (TypeScript/JavaScript).".into()
+                    );
                 }
             }
         }
@@ -341,55 +314,46 @@ fn cmd_peek(
     Ok(())
 }
 
-fn cmd_find(
-    query: &str,
-    search_all: bool,
-    no_cache: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_find(query: &str, no_cache: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let project_dir = Utf8PathBuf::from(".");
+    let deps = resolve_project_deps(&project_dir)?;
+
+    // Auto-build cache if it doesn't exist (unless --no-cache)
+    if !no_cache && !Cache::exists() {
+        eprintln!("Building cache for {} dependencies...", deps.len());
+        parallel_index(&deps, false).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    }
+
     // Try cache first
     if !no_cache && Cache::exists() {
         if let Ok(cache) = Cache::open_existing() {
             let results = cache.search(query)?;
-            if !results.is_empty() {
-                // Default: filter to project deps (unless --all)
-                let results = if !search_all {
-                    let deps = resolve_project_deps(&Utf8PathBuf::from("."))?;
-                    let dep_set: std::collections::HashSet<_> = deps
-                        .iter()
-                        .map(|d| (d.name.as_str(), d.version.as_str()))
-                        .collect();
-                    results
-                        .into_iter()
-                        .filter(|r| {
-                            dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str()))
-                        })
-                        .collect()
-                } else {
-                    results
-                };
+            // Filter to project deps only
+            let dep_set: std::collections::HashSet<_> = deps
+                .iter()
+                .map(|d| (d.name.as_str(), d.version.as_str()))
+                .collect();
+            let results: Vec<_> = results
+                .into_iter()
+                .filter(|r| dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str())))
+                .collect();
 
-                eprintln!("(from cache)");
-                for r in &results {
-                    println!(
-                        "{}@{}: {} ({})",
-                        r.crate_name, r.crate_version, r.path, r.kind
-                    );
-                }
-                eprintln!("\n{} matches found", results.len());
-                return Ok(());
+            eprintln!("(from cache)");
+            for r in &results {
+                println!(
+                    "{}@{}: {} ({})",
+                    r.crate_name, r.crate_version, r.path, r.kind
+                );
             }
+            eprintln!("\n{} matches found", results.len());
+            return Ok(());
         }
     }
 
-    // Fall back to parallel parsing using rayon
+    // Fall back to parallel parsing using rayon (only if --no-cache)
     use rayon::prelude::*;
 
-    // Default: project deps only (unless --all)
-    let crates = if search_all {
-        list_registry_crates()?
-    } else {
-        resolve_project_deps(&Utf8PathBuf::from("."))?
-    };
+    let crates = deps;
 
     let query_lower = query.to_lowercase();
 

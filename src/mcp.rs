@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) server for fastdeps.
 
 use crate::cache::Cache;
-use crate::cargo::{RegistryCrate, list_registry_crates, resolve_project_deps};
+use crate::cargo::{RegistryCrate, resolve_project_deps};
 use crate::languages::rust::RustParser;
 use crate::schema::Item;
 use camino::Utf8PathBuf;
@@ -55,14 +55,10 @@ impl FastdepsService {
         }
     }
 
-    fn list_impl(&self, filter: Option<String>, latest: bool, all: bool) -> Result<String, String> {
-        let mut crates = if all {
-            // List all crates in the cargo registry
-            list_registry_crates().map_err(|e| e.to_string())?
-        } else {
-            // Default: list only project dependencies
-            resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?
-        };
+    fn list_impl(&self, filter: Option<String>, latest: bool) -> Result<String, String> {
+        // List only project dependencies
+        let mut crates =
+            resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?;
 
         if let Some(ref f) = filter {
             crates.retain(|c| c.name.contains(f));
@@ -171,50 +167,45 @@ impl FastdepsService {
         }
     }
 
-    fn find_impl(&self, query: String, search_all: bool) -> Result<String, String> {
-        // Try cache first
+    fn find_impl(&self, query: String) -> Result<String, String> {
+        let deps = resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?;
+
+        // Auto-build cache if it doesn't exist
+        if !Cache::exists() {
+            crate::cache::parallel_index(&deps, false).map_err(|e| e.to_string())?;
+        }
+
+        // Use cache for fast search
         if Cache::exists() {
             if let Ok(cache) = Cache::open_existing() {
                 let results = cache.search(&query).map_err(|e| e.to_string())?;
-                if !results.is_empty() {
-                    // Default: filter to project deps (unless all=true)
-                    let results = if !search_all {
-                        let deps = resolve_project_deps(&Utf8PathBuf::from("."))
-                            .map_err(|e| e.to_string())?;
-                        let dep_set: std::collections::HashSet<_> = deps
-                            .iter()
-                            .map(|d| (d.name.as_str(), d.version.as_str()))
-                            .collect();
-                        results
-                            .into_iter()
-                            .filter(|r| {
-                                dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str()))
-                            })
-                            .collect()
-                    } else {
-                        results
-                    };
+                // Filter to project deps only
+                let dep_set: std::collections::HashSet<_> = deps
+                    .iter()
+                    .map(|d| (d.name.as_str(), d.version.as_str()))
+                    .collect();
+                let results: Vec<_> = results
+                    .into_iter()
+                    .filter(|r| {
+                        dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str()))
+                    })
+                    .collect();
 
-                    let formatted: Vec<String> = results
-                        .iter()
-                        .map(|r| {
-                            format!(
-                                "{}@{}: {} ({})",
-                                r.crate_name, r.crate_version, r.path, r.kind
-                            )
-                        })
-                        .collect();
-                    return Ok(formatted.join("\n"));
-                }
+                let formatted: Vec<String> = results
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}@{}: {} ({})",
+                            r.crate_name, r.crate_version, r.path, r.kind
+                        )
+                    })
+                    .collect();
+                return Ok(formatted.join("\n"));
             }
         }
 
-        // Fall back to parsing - default to project deps
-        let crates = if search_all {
-            list_registry_crates().map_err(|e| e.to_string())?
-        } else {
-            resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?
-        };
+        // Fall back to parsing - project deps only (shouldn't normally reach here)
+        let crates = deps;
 
         let query_lower = query.to_lowercase();
         let mut parser = RustParser::new().map_err(|e| e.to_string())?;
@@ -266,8 +257,6 @@ struct ListParams {
     filter: Option<String>,
     /// Show only the latest version of each crate
     latest: Option<bool>,
-    /// List ALL crates in cargo registry (not just project deps)
-    all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -288,8 +277,6 @@ struct PeekParams {
 struct FindParams {
     /// Symbol to search for (e.g., "Serialize", "spawn")
     query: String,
-    /// Search ALL registry crates (not just project deps)
-    all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -330,7 +317,7 @@ impl ServerHandler for FastdepsService {
                 tools: vec![
                     Tool::new(
                         "list",
-                        "List dependencies (project deps by default, use all=true for full registry)",
+                        "List project dependencies",
                         cached_schema_for_type::<ListParams>(),
                     ),
                     Tool::new(
@@ -345,7 +332,7 @@ impl ServerHandler for FastdepsService {
                     ),
                     Tool::new(
                         "find",
-                        "Search for a symbol across dependencies (project deps by default, use all=true for full registry)",
+                        "Search for a symbol across project dependencies",
                         cached_schema_for_type::<FindParams>(),
                     ),
                     Tool::new(
@@ -377,14 +364,9 @@ impl ServerHandler for FastdepsService {
                         serde_json::from_value(args_value).unwrap_or(ListParams {
                             filter: None,
                             latest: None,
-                            all: None,
                         });
 
-                    match this.list_impl(
-                        params.filter,
-                        params.latest.unwrap_or(false),
-                        params.all.unwrap_or(false),
-                    ) {
+                    match this.list_impl(params.filter, params.latest.unwrap_or(false)) {
                         Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
                         Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                     }
@@ -413,7 +395,7 @@ impl ServerHandler for FastdepsService {
                         McpError::invalid_params(format!("Invalid parameters: {}", e), None)
                     })?;
 
-                    match this.find_impl(params.query, params.all.unwrap_or(false)) {
+                    match this.find_impl(params.query) {
                         Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
                         Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                     }
