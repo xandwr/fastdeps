@@ -2,11 +2,14 @@ mod cache;
 mod cargo;
 mod languages;
 mod mcp;
+mod npm;
 mod schema;
 
 use crate::cache::{Cache, parallel_index};
 use crate::cargo::{RegistryCrate, find_crate, list_registry_crates, resolve_project_deps};
 use crate::languages::rust::RustParser;
+use crate::languages::typescript::{TsLanguage, TypeScriptParser};
+use crate::npm::parse_package_json;
 use crate::schema::{Item, PackageItems};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
@@ -88,6 +91,27 @@ enum Commands {
         module: String,
     },
 
+    /// Parse a single TypeScript/JavaScript file
+    ParseTs {
+        /// Path to the .ts/.tsx/.js file
+        file: Utf8PathBuf,
+
+        /// Module path prefix
+        #[arg(short, long, default_value = "module")]
+        module: String,
+    },
+
+    /// Peek at a TypeScript/JavaScript project's API surface
+    PeekTs {
+        /// Path to project directory (with package.json)
+        #[arg(short, long, default_value = ".")]
+        path: Utf8PathBuf,
+
+        /// Show full details including methods and fields
+        #[arg(short, long)]
+        full: bool,
+    },
+
     /// Manage the local cache
     Cache {
         #[command(subcommand)]
@@ -133,6 +157,8 @@ fn main() {
         } => cmd_find(&query, project, no_cache),
         Commands::Where { name } => cmd_where(&name),
         Commands::Parse { file, module } => cmd_parse(&file, &module),
+        Commands::ParseTs { file, module } => cmd_parse_ts(&file, &module),
+        Commands::PeekTs { path, full } => cmd_peek_ts(&path, full),
         Commands::Cache { action } => match action {
             CacheAction::Build { force } => cmd_cache_build(force),
             CacheAction::Stats => cmd_cache_stats(),
@@ -377,6 +403,72 @@ fn cmd_parse(file: &Utf8PathBuf, module: &str) -> Result<(), Box<dyn std::error:
     let items = parser.parse_source(&source, module)?;
     let package = PackageItems { items };
     println!("{}", serde_json::to_string_pretty(&package)?);
+    Ok(())
+}
+
+fn cmd_parse_ts(file: &Utf8PathBuf, module: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let source = fs::read_to_string(file)?;
+
+    // Determine language from extension
+    let language = match file.extension() {
+        Some("tsx") => TsLanguage::Tsx,
+        Some("jsx") => TsLanguage::Tsx,
+        Some("js") | Some("mjs") | Some("cjs") => TsLanguage::JavaScript,
+        _ => TsLanguage::TypeScript,
+    };
+
+    let mut parser = TypeScriptParser::new(language)?;
+    let items = parser.parse_source(&source, module)?;
+    let package = PackageItems { items };
+    println!("{}", serde_json::to_string_pretty(&package)?);
+    Ok(())
+}
+
+fn cmd_peek_ts(path: &Utf8PathBuf, full: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let pkg = parse_package_json(path)?;
+    eprintln!("Parsing {}@{} ...", pkg.name, pkg.version);
+
+    let mut all_items: Vec<Item> = Vec::new();
+
+    for source_file in pkg.source_files() {
+        let relative = source_file.strip_prefix(&pkg.path).unwrap_or(&source_file);
+        let module_path = npm::path_to_module(&pkg.name, relative);
+
+        // Determine language from extension
+        let language = match source_file.extension() {
+            Some("tsx") | Some("jsx") => TsLanguage::Tsx,
+            Some("js") | Some("mjs") | Some("cjs") => TsLanguage::JavaScript,
+            _ => TsLanguage::TypeScript,
+        };
+
+        if let Ok(source) = fs::read_to_string(&source_file) {
+            if let Ok(mut parser) = TypeScriptParser::new(language) {
+                if let Ok(items) = parser.parse_source(&source, &module_path) {
+                    all_items.extend(items);
+                }
+            }
+        }
+    }
+
+    // Sort items by path for consistent output
+    all_items.sort_by(|a, b| a.path.cmp(&b.path));
+
+    if full {
+        let package = PackageItems { items: all_items };
+        println!("{}", serde_json::to_string_pretty(&package)?);
+    } else {
+        // Compact output: just paths and kinds
+        for item in &all_items {
+            let kind = format!("{:?}", item.kind).to_lowercase();
+            if let Some(sig) = &item.signature {
+                println!("{} ({}) - {}", item.path, kind, sig);
+            } else {
+                println!("{} ({})", item.path, kind);
+            }
+        }
+        eprintln!("\n{} items found", all_items.len());
+    }
+
     Ok(())
 }
 

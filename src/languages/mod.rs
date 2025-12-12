@@ -4,8 +4,8 @@
 //! producing the universal `schema::Item` format.
 
 pub mod rust;
+pub mod typescript;
 
 // Future:
-// pub mod typescript;
 // pub mod python;
 // pub mod go;
