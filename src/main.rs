@@ -52,6 +52,10 @@ enum Commands {
         /// Skip cache, parse fresh
         #[arg(long)]
         no_cache: bool,
+
+        /// Project path to search for path dependencies
+        #[arg(short, long)]
+        project: Option<Utf8PathBuf>,
     },
 
     /// Search for a symbol across dependencies
@@ -116,8 +120,17 @@ fn main() {
     let result = match cli.command {
         Commands::List { filter, latest } => cmd_list(filter, latest),
         Commands::Deps { path } => cmd_deps(path),
-        Commands::Peek { name, full, no_cache } => cmd_peek(&name, full, no_cache),
-        Commands::Find { query, project, no_cache } => cmd_find(&query, project, no_cache),
+        Commands::Peek {
+            name,
+            full,
+            no_cache,
+            project,
+        } => cmd_peek(&name, full, no_cache, project),
+        Commands::Find {
+            query,
+            project,
+            no_cache,
+        } => cmd_find(&query, project, no_cache),
         Commands::Where { name } => cmd_where(&name),
         Commands::Parse { file, module } => cmd_parse(&file, &module),
         Commands::Cache { action } => match action {
@@ -182,7 +195,12 @@ fn cmd_deps(path: Option<Utf8PathBuf>) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn cmd_peek(name: &str, full: bool, no_cache: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_peek(
+    name: &str,
+    full: bool,
+    no_cache: bool,
+    project: Option<Utf8PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (crate_name, version) = parse_crate_spec(name);
 
     // Try cache first
@@ -204,8 +222,8 @@ fn cmd_peek(name: &str, full: bool, no_cache: bool) -> Result<(), Box<dyn std::e
         }
     }
 
-    // Fall back to parsing
-    let krate = find_specific_crate(crate_name, version)?;
+    // Fall back to parsing - try project path deps first, then registry
+    let krate = find_specific_crate(crate_name, version, project.as_ref())?;
     eprintln!("Parsing {}@{} ...", krate.name, krate.version);
 
     let mut parser = RustParser::new()?;
@@ -246,7 +264,11 @@ fn cmd_peek(name: &str, full: bool, no_cache: bool) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-fn cmd_find(query: &str, project_only: bool, no_cache: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_find(
+    query: &str,
+    project_only: bool,
+    no_cache: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Try cache first
     if !no_cache && Cache::exists() {
         if let Ok(cache) = Cache::open_existing() {
@@ -261,7 +283,9 @@ fn cmd_find(query: &str, project_only: bool, no_cache: bool) -> Result<(), Box<d
                         .collect();
                     results
                         .into_iter()
-                        .filter(|r| dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str())))
+                        .filter(|r| {
+                            dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str()))
+                        })
                         .collect()
                 } else {
                     results
@@ -269,7 +293,10 @@ fn cmd_find(query: &str, project_only: bool, no_cache: bool) -> Result<(), Box<d
 
                 eprintln!("(from cache)");
                 for r in &results {
-                    println!("{}@{}: {} ({})", r.crate_name, r.crate_version, r.path, r.kind);
+                    println!(
+                        "{}@{}: {} ({})",
+                        r.crate_name, r.crate_version, r.path, r.kind
+                    );
                 }
                 eprintln!("\n{} matches found", results.len());
                 return Ok(());
@@ -315,7 +342,7 @@ fn cmd_find(query: &str, project_only: bool, no_cache: bool) -> Result<(), Box<d
 
 fn cmd_where(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (crate_name, version) = parse_crate_spec(name);
-    let krate = find_specific_crate(crate_name, version)?;
+    let krate = find_specific_crate(crate_name, version, None)?;
 
     println!("{}", krate.path);
 
@@ -356,7 +383,10 @@ fn cmd_cache_stats() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Crates indexed: {}", stats.crate_count);
     println!("Items indexed:  {}", stats.item_count);
-    println!("Database size:  {:.2} MB", stats.db_size_bytes as f64 / 1_000_000.0);
+    println!(
+        "Database size:  {:.2} MB",
+        stats.db_size_bytes as f64 / 1_000_000.0
+    );
 
     Ok(())
 }
@@ -392,10 +422,29 @@ fn parse_crate_spec(spec: &str) -> (&str, Option<&str>) {
 }
 
 /// Find a crate, preferring specific version or latest.
+/// If project_dir is provided, also checks path dependencies.
 fn find_specific_crate(
     name: &str,
     version: Option<&str>,
+    project_dir: Option<&Utf8PathBuf>,
 ) -> Result<RegistryCrate, Box<dyn std::error::Error>> {
+    // First, check project path dependencies if a project dir is provided
+    if let Some(proj_dir) = project_dir {
+        let deps = resolve_project_deps(proj_dir)?;
+        for dep in deps {
+            if dep.name == name {
+                if let Some(v) = version {
+                    if dep.version == v {
+                        return Ok(dep);
+                    }
+                } else {
+                    return Ok(dep);
+                }
+            }
+        }
+    }
+
+    // Fall back to registry
     let crates = find_crate(name)?;
 
     if crates.is_empty() {

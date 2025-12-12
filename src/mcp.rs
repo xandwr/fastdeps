@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) server for fastdeps.
 
 use crate::cache::Cache;
-use crate::cargo::{list_registry_crates, resolve_project_deps, RegistryCrate};
+use crate::cargo::{RegistryCrate, list_registry_crates, resolve_project_deps};
 use crate::languages::rust::RustParser;
 use crate::schema::Item;
 use camino::Utf8PathBuf;
@@ -181,8 +181,7 @@ impl FastdepsService {
                         results
                             .into_iter()
                             .filter(|r| {
-                                dep_set
-                                    .contains(&(r.crate_name.as_str(), r.crate_version.as_str()))
+                                dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str()))
                             })
                             .collect()
                     } else {
@@ -434,10 +433,7 @@ fn parse_crate_spec(spec: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn find_specific_crate(
-    name: &str,
-    version: Option<&str>,
-) -> Result<RegistryCrate, String> {
+fn find_specific_crate(name: &str, version: Option<&str>) -> Result<RegistryCrate, String> {
     use crate::cargo::find_crate;
 
     let crates = find_crate(name).map_err(|e| e.to_string())?;

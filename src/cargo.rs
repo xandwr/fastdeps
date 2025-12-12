@@ -178,14 +178,81 @@ struct LockPackage {
     source: Option<String>,
 }
 
+// === Cargo.toml parsing for path dependencies ===
+
+#[derive(Debug, Deserialize)]
+struct CargoToml {
+    dependencies: Option<toml::Table>,
+    #[serde(rename = "dev-dependencies")]
+    dev_dependencies: Option<toml::Table>,
+    #[serde(rename = "build-dependencies")]
+    build_dependencies: Option<toml::Table>,
+}
+
 /// Locked dependency from Cargo.lock.
 #[derive(Debug, Clone)]
 pub struct LockedDep {
     pub name: String,
     pub version: String,
+    /// None for registry deps, Some(path) for path deps
+    pub path: Option<Utf8PathBuf>,
+}
+
+/// Extract path dependencies from a Cargo.toml dependency table.
+fn extract_path_deps(table: &toml::Table, project_dir: &Utf8Path) -> Vec<(String, Utf8PathBuf)> {
+    let mut path_deps = Vec::new();
+
+    for (name, value) in table {
+        if let toml::Value::Table(dep_table) = value {
+            if let Some(toml::Value::String(path_str)) = dep_table.get("path") {
+                // Resolve the path relative to project directory
+                let dep_path = project_dir.join(path_str);
+                if let Ok(canonical) = dep_path.canonicalize_utf8() {
+                    path_deps.push((name.clone(), canonical));
+                } else if dep_path.exists() {
+                    path_deps.push((name.clone(), dep_path));
+                }
+            }
+        }
+    }
+
+    path_deps
+}
+
+/// Parse Cargo.toml to find all path dependencies.
+fn parse_path_deps(project_dir: &Utf8Path) -> Result<Vec<(String, Utf8PathBuf)>, CargoError> {
+    let toml_path = project_dir.join("Cargo.toml");
+    if !toml_path.exists() {
+        return Ok(vec![]);
+    }
+
+    let contents = fs::read_to_string(&toml_path).map_err(|e| CargoError::ReadError {
+        path: toml_path.clone(),
+        source: e,
+    })?;
+
+    let manifest: CargoToml = toml::from_str(&contents).map_err(|e| CargoError::TomlError {
+        path: toml_path,
+        source: e,
+    })?;
+
+    let mut path_deps = Vec::new();
+
+    if let Some(deps) = &manifest.dependencies {
+        path_deps.extend(extract_path_deps(deps, project_dir));
+    }
+    if let Some(deps) = &manifest.dev_dependencies {
+        path_deps.extend(extract_path_deps(deps, project_dir));
+    }
+    if let Some(deps) = &manifest.build_dependencies {
+        path_deps.extend(extract_path_deps(deps, project_dir));
+    }
+
+    Ok(path_deps)
 }
 
 /// Parse Cargo.lock to get exact dependency versions.
+/// Includes both registry and path dependencies.
 pub fn parse_cargo_lock(project_dir: &Utf8Path) -> Result<Vec<LockedDep>, CargoError> {
     let lock_path = project_dir.join("Cargo.lock");
     if !lock_path.exists() {
@@ -202,27 +269,60 @@ pub fn parse_cargo_lock(project_dir: &Utf8Path) -> Result<Vec<LockedDep>, CargoE
         source: e,
     })?;
 
+    // Get path dependencies from Cargo.toml
+    let path_deps = parse_path_deps(project_dir)?;
+    let path_dep_map: std::collections::HashMap<&str, &Utf8PathBuf> =
+        path_deps.iter().map(|(n, p)| (n.as_str(), p)).collect();
+
     let deps = lock
         .package
         .unwrap_or_default()
         .into_iter()
-        .filter(|p| p.source.is_some()) // Only external deps have a source
-        .map(|p| LockedDep {
-            name: p.name,
-            version: p.version,
+        .filter_map(|p| {
+            // Check if this is a path dependency (no source in Cargo.lock)
+            if p.source.is_none() {
+                // Look up the path from Cargo.toml
+                if let Some(path) = path_dep_map.get(p.name.as_str()) {
+                    return Some(LockedDep {
+                        name: p.name,
+                        version: p.version,
+                        path: Some((*path).clone()),
+                    });
+                }
+                // Path dep not found in Cargo.toml - skip it
+                return None;
+            }
+            // Registry dependency
+            Some(LockedDep {
+                name: p.name,
+                version: p.version,
+                path: None,
+            })
         })
         .collect();
 
     Ok(deps)
 }
 
-/// Get all dependencies for a project with their registry paths.
+/// Get all dependencies for a project with their paths.
+/// Includes both registry crates and local path dependencies.
 pub fn resolve_project_deps(project_dir: &Utf8Path) -> Result<Vec<RegistryCrate>, CargoError> {
     let locked = parse_cargo_lock(project_dir)?;
     let registry = list_registry_crates()?;
 
     let mut resolved = Vec::new();
     for dep in locked {
+        // Path dependency - use the path directly
+        if let Some(path) = dep.path {
+            resolved.push(RegistryCrate {
+                name: dep.name,
+                version: dep.version,
+                path,
+            });
+            continue;
+        }
+
+        // Registry dependency - look up in registry
         if let Some(krate) = registry
             .iter()
             .find(|c| c.name == dep.name && c.version == dep.version)

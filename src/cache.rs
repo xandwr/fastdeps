@@ -151,9 +151,7 @@ impl Cache {
 
     /// Get list of already indexed crate name@version pairs.
     pub fn get_indexed_set(&self) -> Result<std::collections::HashSet<String>, CacheError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, version FROM crates")?;
+        let mut stmt = self.conn.prepare("SELECT name, version FROM crates")?;
         let results = stmt
             .query_map([], |row| {
                 let name: String = row.get(0)?;
@@ -474,7 +472,12 @@ pub fn parallel_index(
             let result = parse_crate(krate);
             // Print progress
             match &result {
-                Ok(parsed) => eprintln!("  {}@{} - {} items", krate.name, krate.version, parsed.items.len()),
+                Ok(parsed) => eprintln!(
+                    "  {}@{} - {} items",
+                    krate.name,
+                    krate.version,
+                    parsed.items.len()
+                ),
                 Err(e) => eprintln!("  {}@{} - error: {}", krate.name, krate.version, e),
             }
             result
