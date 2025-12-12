@@ -55,8 +55,14 @@ impl FastdepsService {
         }
     }
 
-    fn list_impl(&self, filter: Option<String>, latest: bool) -> Result<String, String> {
-        let mut crates = list_registry_crates().map_err(|e| e.to_string())?;
+    fn list_impl(&self, filter: Option<String>, latest: bool, all: bool) -> Result<String, String> {
+        let mut crates = if all {
+            // List all crates in the cargo registry
+            list_registry_crates().map_err(|e| e.to_string())?
+        } else {
+            // Default: list only project dependencies
+            resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?
+        };
 
         if let Some(ref f) = filter {
             crates.retain(|c| c.name.contains(f));
@@ -165,13 +171,14 @@ impl FastdepsService {
         }
     }
 
-    fn find_impl(&self, query: String, project: bool) -> Result<String, String> {
+    fn find_impl(&self, query: String, search_all: bool) -> Result<String, String> {
         // Try cache first
         if Cache::exists() {
             if let Ok(cache) = Cache::open_existing() {
                 let results = cache.search(&query).map_err(|e| e.to_string())?;
                 if !results.is_empty() {
-                    let results = if project {
+                    // Default: filter to project deps (unless all=true)
+                    let results = if !search_all {
                         let deps = resolve_project_deps(&Utf8PathBuf::from("."))
                             .map_err(|e| e.to_string())?;
                         let dep_set: std::collections::HashSet<_> = deps
@@ -202,11 +209,11 @@ impl FastdepsService {
             }
         }
 
-        // Fall back to parsing
-        let crates = if project {
-            resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?
-        } else {
+        // Fall back to parsing - default to project deps
+        let crates = if search_all {
             list_registry_crates().map_err(|e| e.to_string())?
+        } else {
+            resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?
         };
 
         let query_lower = query.to_lowercase();
@@ -259,6 +266,8 @@ struct ListParams {
     filter: Option<String>,
     /// Show only the latest version of each crate
     latest: Option<bool>,
+    /// List ALL crates in cargo registry (not just project deps)
+    all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -279,8 +288,8 @@ struct PeekParams {
 struct FindParams {
     /// Symbol to search for (e.g., "Serialize", "spawn")
     query: String,
-    /// Only search in project dependencies (requires Cargo.lock)
-    project: Option<bool>,
+    /// Search ALL registry crates (not just project deps)
+    all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -321,7 +330,7 @@ impl ServerHandler for FastdepsService {
                 tools: vec![
                     Tool::new(
                         "list",
-                        "List all crates in your cargo registry",
+                        "List dependencies (project deps by default, use all=true for full registry)",
                         cached_schema_for_type::<ListParams>(),
                     ),
                     Tool::new(
@@ -336,7 +345,7 @@ impl ServerHandler for FastdepsService {
                     ),
                     Tool::new(
                         "find",
-                        "Search for a symbol across dependencies",
+                        "Search for a symbol across dependencies (project deps by default, use all=true for full registry)",
                         cached_schema_for_type::<FindParams>(),
                     ),
                     Tool::new(
@@ -368,9 +377,14 @@ impl ServerHandler for FastdepsService {
                         serde_json::from_value(args_value).unwrap_or(ListParams {
                             filter: None,
                             latest: None,
+                            all: None,
                         });
 
-                    match this.list_impl(params.filter, params.latest.unwrap_or(false)) {
+                    match this.list_impl(
+                        params.filter,
+                        params.latest.unwrap_or(false),
+                        params.all.unwrap_or(false),
+                    ) {
                         Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
                         Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                     }
@@ -399,7 +413,7 @@ impl ServerHandler for FastdepsService {
                         McpError::invalid_params(format!("Invalid parameters: {}", e), None)
                     })?;
 
-                    match this.find_impl(params.query, params.project.unwrap_or(false)) {
+                    match this.find_impl(params.query, params.all.unwrap_or(false)) {
                         Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
                         Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                     }

@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List all crates in your cargo registry
+    /// List dependencies (project deps by default, --all for full registry)
     List {
         /// Filter by crate name (substring match)
         #[arg(short, long)]
@@ -34,6 +34,10 @@ enum Commands {
         /// Show only the latest version of each crate
         #[arg(short = 'L', long)]
         latest: bool,
+
+        /// List ALL crates in cargo registry (not just project deps)
+        #[arg(short, long)]
+        all: bool,
     },
 
     /// List dependencies of the current project
@@ -66,9 +70,9 @@ enum Commands {
         /// Symbol to search for (e.g., "Serialize", "spawn")
         query: String,
 
-        /// Only search in project dependencies (requires Cargo.lock)
+        /// Search ALL registry crates (not just project deps)
         #[arg(short, long)]
-        project: bool,
+        all: bool,
 
         /// Skip cache, parse fresh (slow)
         #[arg(long)]
@@ -142,7 +146,11 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::List { filter, latest } => cmd_list(filter, latest),
+        Commands::List {
+            filter,
+            latest,
+            all,
+        } => cmd_list(filter, latest, all),
         Commands::Deps { path } => cmd_deps(path),
         Commands::Peek {
             name,
@@ -152,9 +160,9 @@ fn main() {
         } => cmd_peek(&name, full, no_cache, project),
         Commands::Find {
             query,
-            project,
+            all,
             no_cache,
-        } => cmd_find(&query, project, no_cache),
+        } => cmd_find(&query, all, no_cache),
         Commands::Where { name } => cmd_where(&name),
         Commands::Parse { file, module } => cmd_parse(&file, &module),
         Commands::ParseTs { file, module } => cmd_parse_ts(&file, &module),
@@ -176,8 +184,51 @@ fn main() {
     }
 }
 
-fn cmd_list(filter: Option<String>, latest: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let mut crates = list_registry_crates()?;
+fn cmd_list(
+    filter: Option<String>,
+    latest: bool,
+    all: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut crates = if all {
+        // List all crates in the cargo registry
+        list_registry_crates()?
+    } else {
+        // Default: list only project dependencies
+        // Try Rust first (Cargo.lock), then TypeScript (package.json)
+        let project_dir = Utf8PathBuf::from(".");
+        match resolve_project_deps(&project_dir) {
+            Ok(deps) => deps,
+            Err(_) => {
+                // Try npm/TypeScript
+                match npm::get_project_deps(&project_dir) {
+                    Ok(npm_deps) => {
+                        // Convert to display format and print directly
+                        let mut deps: Vec<_> = npm_deps
+                            .iter()
+                            .map(|d| (d.name.clone(), d.version.clone()))
+                            .collect();
+
+                        if let Some(ref f) = filter {
+                            deps.retain(|(name, _)| name.contains(f));
+                        }
+
+                        deps.sort();
+                        for (name, version) in &deps {
+                            println!("{}@{}", name, version);
+                        }
+                        eprintln!("\n{} dependencies found", deps.len());
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "No Cargo.lock or package.json found. Use --all to list all registry crates."
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
 
     if let Some(ref f) = filter {
         crates.retain(|c| c.name.contains(f));
@@ -292,7 +343,7 @@ fn cmd_peek(
 
 fn cmd_find(
     query: &str,
-    project_only: bool,
+    search_all: bool,
     no_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Try cache first
@@ -300,8 +351,8 @@ fn cmd_find(
         if let Ok(cache) = Cache::open_existing() {
             let results = cache.search(query)?;
             if !results.is_empty() {
-                // If project_only, filter to project deps
-                let results = if project_only {
+                // Default: filter to project deps (unless --all)
+                let results = if !search_all {
                     let deps = resolve_project_deps(&Utf8PathBuf::from("."))?;
                     let dep_set: std::collections::HashSet<_> = deps
                         .iter()
@@ -333,10 +384,11 @@ fn cmd_find(
     // Fall back to parallel parsing using rayon
     use rayon::prelude::*;
 
-    let crates = if project_only {
-        resolve_project_deps(&Utf8PathBuf::from("."))?
-    } else {
+    // Default: project deps only (unless --all)
+    let crates = if search_all {
         list_registry_crates()?
+    } else {
+        resolve_project_deps(&Utf8PathBuf::from("."))?
     };
 
     let query_lower = query.to_lowercase();
