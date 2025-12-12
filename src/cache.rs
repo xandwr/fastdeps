@@ -7,12 +7,15 @@ use camino::Utf8PathBuf;
 use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use std::fs;
-use std::sync::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use thiserror::Error;
 
 const CACHE_DIR: &str = ".fastdeps";
 const DB_FILE: &str = "cache.sqlite";
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -86,6 +89,7 @@ impl Cache {
     }
 
     fn init_schema(&self) -> Result<(), CacheError> {
+        // Create base tables
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS meta (
@@ -119,12 +123,75 @@ impl Cache {
             "#,
         )?;
 
-        // Set schema version if not present
+        // Check current schema version and migrate if needed
+        let current_version: i32 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '0')",
+                [],
+                |row| {
+                    let v: String = row.get(0)?;
+                    Ok(v.parse().unwrap_or(0))
+                },
+            )
+            .unwrap_or(0);
+
+        if current_version < 2 {
+            self.migrate_to_v2()?;
+        }
+
+        // Update schema version
         self.conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             params![SCHEMA_VERSION.to_string()],
         )?;
 
+        Ok(())
+    }
+
+    /// Migrate schema from v1 to v2: Add FTS5 full-text search
+    fn migrate_to_v2(&self) -> Result<(), CacheError> {
+        eprintln!("Migrating cache to v2 (adding FTS5 search)...");
+
+        // Create FTS5 virtual table for fast text search
+        // Using trigram tokenizer for substring matching
+        self.conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+                path,
+                content='items',
+                content_rowid='id',
+                tokenize='trigram'
+            );
+
+            -- Triggers to keep FTS index in sync with items table
+            CREATE TRIGGER IF NOT EXISTS items_fts_insert AFTER INSERT ON items BEGIN
+                INSERT INTO items_fts(rowid, path) VALUES (new.id, new.path);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS items_fts_delete AFTER DELETE ON items BEGIN
+                INSERT INTO items_fts(items_fts, rowid, path) VALUES('delete', old.id, old.path);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS items_fts_update AFTER UPDATE ON items BEGIN
+                INSERT INTO items_fts(items_fts, rowid, path) VALUES('delete', old.id, old.path);
+                INSERT INTO items_fts(rowid, path) VALUES (new.id, new.path);
+            END;
+            "#,
+        )?;
+
+        // Rebuild FTS index from existing data
+        let item_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
+
+        if item_count > 0 {
+            eprintln!("Rebuilding FTS index for {} items...", item_count);
+            self.conn
+                .execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')", [])?;
+        }
+
+        eprintln!("Migration to v2 complete.");
         Ok(())
     }
 
@@ -225,38 +292,30 @@ impl Cache {
 
         self.conn.execute("BEGIN IMMEDIATE", [])?;
 
-        for (krate, items) in batch {
-            // Insert or replace crate
-            self.conn.execute(
-                r#"
-                INSERT OR REPLACE INTO crates (name, version, path, indexed_at)
-                VALUES (?, ?, ?, ?)
-                "#,
-                params![krate.name, krate.version, krate.path.as_str(), now],
-            )?;
+        // Pre-prepare statements for better performance
+        let mut crate_stmt = self.conn.prepare_cached(
+            "INSERT OR REPLACE INTO crates (name, version, path, indexed_at) VALUES (?, ?, ?, ?)",
+        )?;
+        let mut delete_stmt = self
+            .conn
+            .prepare_cached("DELETE FROM items WHERE crate_id = ?")?;
+        let mut item_stmt = self.conn.prepare_cached(
+            "INSERT OR REPLACE INTO items (crate_id, path, kind, signature, doc, visibility) VALUES (?, ?, ?, ?, ?, ?)",
+        )?;
 
-            let crate_id: i64 = self.conn.query_row(
-                "SELECT id FROM crates WHERE name = ? AND version = ?",
-                params![krate.name, krate.version],
-                |row| row.get(0),
-            )?;
+        for (krate, items) in batch {
+            // Insert or replace crate and get ID via last_insert_rowid
+            crate_stmt.execute(params![krate.name, krate.version, krate.path.as_str(), now])?;
+            let crate_id = self.conn.last_insert_rowid();
 
             // Delete old items for this crate
-            self.conn
-                .execute("DELETE FROM items WHERE crate_id = ?", params![crate_id])?;
+            delete_stmt.execute(params![crate_id])?;
 
-            // Insert items (use OR REPLACE in case of duplicate paths from re-exports)
-            let mut stmt = self.conn.prepare_cached(
-                r#"
-                INSERT OR REPLACE INTO items (crate_id, path, kind, signature, doc, visibility)
-                VALUES (?, ?, ?, ?, ?, ?)
-                "#,
-            )?;
-
+            // Insert items
             for item in items {
                 let kind = format!("{:?}", item.kind).to_lowercase();
                 let vis = format!("{:?}", item.visibility).to_lowercase();
-                stmt.execute(params![
+                item_stmt.execute(params![
                     crate_id,
                     item.path,
                     kind,
@@ -267,26 +326,33 @@ impl Cache {
             }
         }
 
+        // Drop statements before commit to release borrows
+        drop(crate_stmt);
+        drop(delete_stmt);
+        drop(item_stmt);
+
         self.conn.execute("COMMIT", [])?;
         Ok(())
     }
 
-    /// Search for items matching a query.
+    /// Search for items matching a query using FTS5 full-text search.
     pub fn search(&self, query: &str) -> Result<Vec<SearchResult>, CacheError> {
-        let pattern = format!("%{}%", query.to_lowercase());
+        // Escape special FTS5 characters and prepare for trigram search
+        let escaped_query = query.replace('"', "\"\"").to_lowercase();
 
+        // Use FTS5 with trigram tokenizer for fast substring matching
         let mut stmt = self.conn.prepare(
             r#"
             SELECT c.name, c.version, i.path, i.kind, i.signature
             FROM items i
             JOIN crates c ON i.crate_id = c.id
-            WHERE LOWER(i.path) LIKE ?
+            WHERE i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)
             ORDER BY c.name, c.version, i.path
             "#,
         )?;
 
         let results = stmt
-            .query_map(params![pattern], |row| {
+            .query_map(params![format!("\"{}\"", escaped_query)], |row| {
                 Ok(SearchResult {
                     crate_name: row.get(0)?,
                     crate_version: row.get(1)?,
@@ -432,7 +498,7 @@ pub fn parse_crate(krate: &RegistryCrate) -> Result<ParsedCrate, String> {
 }
 
 /// Index multiple crates in parallel using rayon for parsing,
-/// then batch-insert into SQLite.
+/// with streaming writes to SQLite as parsing completes.
 pub fn parallel_index(
     crates: &[RegistryCrate],
     force: bool,
@@ -450,6 +516,7 @@ pub fn parallel_index(
     let to_index: Vec<_> = crates
         .iter()
         .filter(|k| force || !indexed_set.contains(&format!("{}@{}", k.name, k.version)))
+        .cloned()
         .collect();
 
     let skipped = crates.len() - to_index.len();
@@ -463,55 +530,102 @@ pub fn parallel_index(
         });
     }
 
-    eprintln!("Parsing {} crates in parallel...", to_index.len());
+    let total_to_index = to_index.len();
+    eprintln!("Indexing {} crates (parsing + writing)...", total_to_index);
 
-    // Parse in parallel using rayon
-    let results: Vec<_> = to_index
-        .par_iter()
-        .map(|krate| {
-            let result = parse_crate(krate);
-            // Print progress
-            match &result {
-                Ok(parsed) => eprintln!(
+    // Shared counters for progress tracking
+    let indexed_count = Arc::new(AtomicUsize::new(0));
+    let failed_count = Arc::new(AtomicUsize::new(0));
+    let total_items = Arc::new(AtomicUsize::new(0));
+
+    // Channel for streaming parsed crates to writer thread
+    let (tx, rx) = mpsc::channel::<ParsedCrate>();
+
+    // Clone counters for writer thread
+    let writer_indexed = Arc::clone(&indexed_count);
+    let writer_items = Arc::clone(&total_items);
+
+    // Spawn writer thread that batches and writes to SQLite
+    let writer_handle = thread::spawn(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let cache = Cache::open()?;
+            let mut batch: Vec<(RegistryCrate, Vec<Item>)> = Vec::new();
+            const BATCH_SIZE: usize = 50;
+
+            for parsed in rx {
+                batch.push((parsed.krate, parsed.items));
+
+                // Write batch when full
+                if batch.len() >= BATCH_SIZE {
+                    cache.batch_index(&batch)?;
+                    writer_indexed.fetch_add(batch.len(), Ordering::Relaxed);
+                    writer_items.fetch_add(
+                        batch.iter().map(|(_, items)| items.len()).sum::<usize>(),
+                        Ordering::Relaxed,
+                    );
+                    batch.clear();
+                }
+            }
+
+            // Flush remaining batch
+            if !batch.is_empty() {
+                cache.batch_index(&batch)?;
+                writer_indexed.fetch_add(batch.len(), Ordering::Relaxed);
+                writer_items.fetch_add(
+                    batch.iter().map(|(_, items)| items.len()).sum::<usize>(),
+                    Ordering::Relaxed,
+                );
+            }
+
+            Ok(())
+        },
+    );
+
+    // Clone counter for parser threads
+    let parser_failed = Arc::clone(&failed_count);
+
+    // Parse in parallel using rayon, streaming results to writer
+    to_index.par_iter().for_each(|krate| {
+        match parse_crate(krate) {
+            Ok(parsed) => {
+                eprintln!(
                     "  {}@{} - {} items",
                     krate.name,
                     krate.version,
                     parsed.items.len()
-                ),
-                Err(e) => eprintln!("  {}@{} - error: {}", krate.name, krate.version, e),
+                );
+                // Send to writer (ignore error if receiver dropped)
+                let _ = tx.send(parsed);
             }
-            result
-        })
-        .collect();
-
-    // Separate successes and failures
-    let mut successes: Vec<(RegistryCrate, Vec<Item>)> = Vec::new();
-    let mut failed = 0;
-
-    for result in results {
-        match result {
-            Ok(parsed) => successes.push((parsed.krate, parsed.items)),
-            Err(_) => failed += 1,
+            Err(e) => {
+                eprintln!("  {}@{} - error: {}", krate.name, krate.version, e);
+                parser_failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
-    }
+    });
 
-    let total_items: usize = successes.iter().map(|(_, items)| items.len()).sum();
-    let indexed = successes.len();
+    // Drop sender to signal writer thread to finish
+    drop(tx);
 
-    // Batch insert into database
-    eprintln!("Writing {} crates to cache...", indexed);
+    // Wait for writer to complete
+    writer_handle
+        .join()
+        .map_err(|_| "Writer thread panicked")??;
 
-    // Insert in chunks to avoid holding transactions too long
-    const CHUNK_SIZE: usize = 50;
-    for chunk in successes.chunks(CHUNK_SIZE) {
-        cache.batch_index(chunk)?;
-    }
+    let indexed = indexed_count.load(Ordering::Relaxed);
+    let failed = failed_count.load(Ordering::Relaxed);
+    let items = total_items.load(Ordering::Relaxed);
+
+    eprintln!(
+        "Done: {} indexed, {} failed, {} items total",
+        indexed, failed, items
+    );
 
     Ok(IndexStats {
         indexed,
         skipped,
         failed,
-        total_items,
+        total_items: items,
     })
 }
 
