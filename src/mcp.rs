@@ -1,9 +1,12 @@
 //! MCP (Model Context Protocol) server for fastdeps.
+//!
+//! Provides smart search with fuzzy matching, pagination, and crate-aware results.
 
 use crate::cache::Cache;
 use crate::cargo::{RegistryCrate, resolve_project_deps};
 use crate::languages::rust::RustParser;
 use crate::schema::Item;
+use crate::search::{CrateRelationship, SearchEngine, SearchOptions, SearchResponse};
 use camino::Utf8PathBuf;
 use rmcp::handler::server::tool::cached_schema_for_type;
 use rmcp::model::{
@@ -55,16 +58,15 @@ impl FastdepsService {
         }
     }
 
-    fn list_impl(&self, filter: Option<String>, latest: bool) -> Result<String, String> {
-        // List only project dependencies
+    fn list_impl(&self, params: ListParams) -> Result<String, String> {
         let mut crates =
             resolve_project_deps(&Utf8PathBuf::from("."), false).map_err(|e| e.to_string())?;
 
-        if let Some(ref f) = filter {
+        if let Some(ref f) = params.filter {
             crates.retain(|c| c.name.contains(f));
         }
 
-        if latest {
+        if params.latest.unwrap_or(false) {
             let mut latest_map: std::collections::BTreeMap<String, RegistryCrate> =
                 std::collections::BTreeMap::new();
             for krate in crates {
@@ -82,11 +84,30 @@ impl FastdepsService {
             crates = latest_map.into_values().collect();
         }
 
-        let result: Vec<String> = crates
-            .iter()
-            .map(|c| format!("{}@{}", c.name, c.version))
-            .collect();
-        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+        let total = crates.len();
+        let offset = params.offset.unwrap_or(0);
+        let limit = params.limit.unwrap_or(50);
+
+        let paginated: Vec<_> = crates.iter().skip(offset).take(limit).collect();
+
+        let mut output = String::new();
+        for c in &paginated {
+            output.push_str(&format!("{}@{}\n", c.name, c.version));
+        }
+
+        output.push_str(&format!(
+            "\n{} crates (showing {}-{} of {})",
+            paginated.len(),
+            offset + 1,
+            (offset + paginated.len()).min(total),
+            total
+        ));
+
+        if offset + limit < total {
+            output.push_str(&format!("\nUse offset={} for next page", offset + limit));
+        }
+
+        Ok(output)
     }
 
     fn deps_impl(&self, path: Option<String>) -> Result<String, String> {
@@ -97,11 +118,54 @@ impl FastdepsService {
             .iter()
             .map(|d| format!("{}@{}", d.name, d.version))
             .collect();
-        Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+
+        Ok(format!(
+            "{}\n\n{} dependencies",
+            result.join("\n"),
+            result.len()
+        ))
     }
 
-    fn peek_impl(&self, name: String, full: bool) -> Result<String, String> {
-        let (crate_name, version) = parse_crate_spec(&name);
+    fn peek_impl(&self, params: PeekParams) -> Result<String, String> {
+        let (crate_name, version) = parse_crate_spec(&params.name);
+
+        // Use search engine for smart crate lookup
+        let engine = SearchEngine::new(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?;
+        let crate_info = engine.get_crate_info(crate_name)?;
+
+        let mut output = String::new();
+
+        // Header with crate info
+        output.push_str(&format!("# {}@{}\n", crate_info.name, crate_info.version));
+
+        if crate_info.is_direct_dep {
+            output.push_str("(direct dependency)\n");
+        } else {
+            output.push_str("(transitive dependency)\n");
+        }
+
+        // Handle re-export crates specially
+        if crate_info.is_reexport && crate_info.item_count == 0 {
+            output.push_str("\nThis is a re-export crate with no direct API.\n");
+
+            if !crate_info.related_crates.is_empty() {
+                output.push_str("\nRelated crates:\n");
+                for related in &crate_info.related_crates {
+                    let marker = match related.relationship {
+                        CrateRelationship::Direct => "→",
+                        CrateRelationship::Prefix => "├",
+                        CrateRelationship::ReExport => "↪",
+                    };
+                    output.push_str(&format!(
+                        "  {} {}@{} ({} items)\n",
+                        marker, related.name, related.version, related.item_count
+                    ));
+                }
+                output.push_str("\nUse: peek <crate_name> to explore a specific crate\n");
+            }
+
+            return Ok(output);
+        }
 
         // Try cache first
         if Cache::exists() {
@@ -109,28 +173,87 @@ impl FastdepsService {
                 let items = cache
                     .search_crate(crate_name, version)
                     .map_err(|e| e.to_string())?;
+
                 if !items.is_empty() {
-                    if full {
-                        return Ok(serde_json::to_string_pretty(&items).unwrap_or_default());
+                    let offset = params.offset.unwrap_or(0);
+                    let limit = params.limit.unwrap_or(30);
+                    let total = items.len();
+
+                    // Apply kind filter
+                    let filtered: Vec<_> = if let Some(ref kind) = params.kind {
+                        items
+                            .into_iter()
+                            .filter(|i| i.kind.eq_ignore_ascii_case(kind))
+                            .collect()
                     } else {
-                        let compact: Vec<String> = items
-                            .iter()
-                            .map(|item| {
-                                if let Some(sig) = &item.signature {
-                                    format!("{} ({}) - {}", item.path, item.kind, sig)
-                                } else {
-                                    format!("{} ({})", item.path, item.kind)
-                                }
-                            })
-                            .collect();
-                        return Ok(compact.join("\n"));
+                        items
+                    };
+
+                    let paginated: Vec<_> = filtered.iter().skip(offset).take(limit).collect();
+
+                    output.push_str(&format!("\n{} items total", total));
+                    if params.kind.is_some() {
+                        output.push_str(&format!(" ({} after filter)", filtered.len()));
                     }
+                    output.push_str("\n\n");
+
+                    if params.full.unwrap_or(false) {
+                        output.push_str(
+                            &serde_json::to_string_pretty(&paginated).unwrap_or_default(),
+                        );
+                    } else {
+                        for item in &paginated {
+                            if let Some(sig) = &item.signature {
+                                // Truncate long signatures
+                                let sig_short = if sig.len() > 80 {
+                                    format!("{}...", &sig[..77])
+                                } else {
+                                    sig.clone()
+                                };
+                                output.push_str(&format!(
+                                    "{} ({}) - {}\n",
+                                    item.path, item.kind, sig_short
+                                ));
+                            } else {
+                                output.push_str(&format!("{} ({})\n", item.path, item.kind));
+                            }
+                        }
+                    }
+
+                    let shown = paginated.len();
+                    if offset + limit < filtered.len() {
+                        output.push_str(&format!(
+                            "\nShowing {}-{} of {}. Use offset={} for next page",
+                            offset + 1,
+                            offset + shown,
+                            filtered.len(),
+                            offset + limit
+                        ));
+                    }
+
+                    // Show related crates if this might be a namespace crate
+                    if !crate_info.related_crates.is_empty() && crate_info.related_crates.len() > 1
+                    {
+                        output.push_str("\n\nRelated crates: ");
+                        let names: Vec<_> = crate_info
+                            .related_crates
+                            .iter()
+                            .filter(|r| r.name != crate_name)
+                            .take(5)
+                            .map(|r| r.name.as_str())
+                            .collect();
+                        output.push_str(&names.join(", "));
+                    }
+
+                    return Ok(output);
                 }
             }
         }
 
         // Fall back to parsing
         let krate = find_specific_crate(crate_name, version)?;
+        output.push_str("\n(parsed fresh - not cached)\n\n");
+
         let mut parser = RustParser::new().map_err(|e| e.to_string())?;
         let mut all_items: Vec<Item> = Vec::new();
 
@@ -149,93 +272,149 @@ impl FastdepsService {
 
         all_items.sort_by(|a, b| a.path.cmp(&b.path));
 
-        if full {
-            Ok(serde_json::to_string_pretty(&all_items).unwrap_or_default())
+        let offset = params.offset.unwrap_or(0);
+        let limit = params.limit.unwrap_or(30);
+
+        let paginated: Vec<_> = all_items.iter().skip(offset).take(limit).collect();
+
+        if params.full.unwrap_or(false) {
+            output.push_str(&serde_json::to_string_pretty(&paginated).unwrap_or_default());
         } else {
-            let compact: Vec<String> = all_items
-                .iter()
-                .map(|item| {
-                    let kind = format!("{:?}", item.kind).to_lowercase();
-                    if let Some(sig) = &item.signature {
-                        format!("{} ({}) - {}", item.path, kind, sig)
+            for item in &paginated {
+                let kind = format!("{:?}", item.kind).to_lowercase();
+                if let Some(sig) = &item.signature {
+                    let sig_short = if sig.len() > 80 {
+                        format!("{}...", &sig[..77])
                     } else {
-                        format!("{} ({})", item.path, kind)
-                    }
-                })
-                .collect();
-            Ok(compact.join("\n"))
-        }
-    }
-
-    fn find_impl(&self, query: String) -> Result<String, String> {
-        let deps =
-            resolve_project_deps(&Utf8PathBuf::from("."), false).map_err(|e| e.to_string())?;
-
-        // Auto-build cache if it doesn't exist
-        if !Cache::exists() {
-            crate::cache::parallel_index(&deps, false).map_err(|e| e.to_string())?;
-        }
-
-        // Use cache for fast search
-        if Cache::exists() {
-            if let Ok(cache) = Cache::open_existing() {
-                let results = cache.search(&query).map_err(|e| e.to_string())?;
-                // Filter to project deps only
-                let dep_set: std::collections::HashSet<_> = deps
-                    .iter()
-                    .map(|d| (d.name.as_str(), d.version.as_str()))
-                    .collect();
-                let results: Vec<_> = results
-                    .into_iter()
-                    .filter(|r| {
-                        dep_set.contains(&(r.crate_name.as_str(), r.crate_version.as_str()))
-                    })
-                    .collect();
-
-                let formatted: Vec<String> = results
-                    .iter()
-                    .map(|r| {
-                        format!(
-                            "{}@{}: {} ({})",
-                            r.crate_name, r.crate_version, r.path, r.kind
-                        )
-                    })
-                    .collect();
-                return Ok(formatted.join("\n"));
-            }
-        }
-
-        // Fall back to parsing - project deps only (shouldn't normally reach here)
-        let crates = deps;
-
-        let query_lower = query.to_lowercase();
-        let mut parser = RustParser::new().map_err(|e| e.to_string())?;
-        let mut found: Vec<String> = Vec::new();
-
-        for krate in crates {
-            for source_file in krate.source_files() {
-                let relative = source_file
-                    .strip_prefix(&krate.path)
-                    .unwrap_or(&source_file);
-                let module_path = crate::path_to_module(&krate.name, relative);
-
-                if let Ok(source) = fs::read_to_string(&source_file) {
-                    if let Ok(items) = parser.parse_source(&source, &module_path) {
-                        for item in items {
-                            if item.path.to_lowercase().contains(&query_lower) {
-                                let kind = format!("{:?}", item.kind).to_lowercase();
-                                found.push(format!(
-                                    "{}@{}: {} ({})",
-                                    krate.name, krate.version, item.path, kind
-                                ));
-                            }
-                        }
-                    }
+                        sig.clone()
+                    };
+                    output.push_str(&format!("{} ({}) - {}\n", item.path, kind, sig_short));
+                } else {
+                    output.push_str(&format!("{} ({})\n", item.path, kind));
                 }
             }
         }
 
-        Ok(found.join("\n"))
+        output.push_str(&format!("\n{} items total", all_items.len()));
+
+        Ok(output)
+    }
+
+    fn find_impl(&self, params: FindParams) -> Result<String, String> {
+        let engine = SearchEngine::new(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?;
+
+        let mut options = SearchOptions::new()
+            .with_limit(params.limit.unwrap_or(25))
+            .with_offset(params.offset.unwrap_or(0));
+
+        if let Some(ref crate_name) = params.crate_filter {
+            options = options.with_crate(crate_name);
+        }
+
+        if params.direct_only.unwrap_or(false) {
+            options = options.direct_only();
+        }
+
+        options.kind_filter = params.kind.clone();
+        options.fuzzy = params.fuzzy.unwrap_or(true);
+
+        // Ensure cache exists
+        if !Cache::exists() {
+            let deps =
+                resolve_project_deps(&Utf8PathBuf::from("."), false).map_err(|e| e.to_string())?;
+            crate::cache::parallel_index(&deps, false).map_err(|e| e.to_string())?;
+        }
+
+        let response = engine.search(&params.query, &options)?;
+
+        let mut output = String::new();
+
+        // Show related crates for crate-level queries
+        if !response.related_crates.is_empty() {
+            output.push_str("Related crates:\n");
+            for crate_info in response.related_crates.iter().take(5) {
+                let marker = if crate_info.item_count > 0 {
+                    "●"
+                } else {
+                    "○"
+                };
+                output.push_str(&format!(
+                    "  {} {}@{} ({} items, {})\n",
+                    marker,
+                    crate_info.name,
+                    crate_info.version,
+                    crate_info.item_count,
+                    crate_info.relationship
+                ));
+            }
+            output.push('\n');
+        }
+
+        // Show results
+        if response.results.is_empty() {
+            output.push_str(&format!("No results for '{}'\n", params.query));
+
+            if !response.suggestions.is_empty() {
+                output.push_str("\nDid you mean?\n");
+                for suggestion in &response.suggestions {
+                    output.push_str(&format!("  - {}\n", suggestion));
+                }
+            }
+        } else {
+            output.push_str(&format!(
+                "Results for '{}' (showing {}-{} of {}):\n\n",
+                params.query,
+                response.pagination.offset + 1,
+                response.pagination.offset + response.results.len(),
+                response.pagination.total
+            ));
+
+            for result in &response.results {
+                let direct_marker = if result.is_direct_dep { "●" } else { "○" };
+                let score_info = if params.show_scores.unwrap_or(false) {
+                    format!(" [{}:{}]", result.match_type, result.score)
+                } else {
+                    String::new()
+                };
+
+                output.push_str(&format!(
+                    "{} {}@{}: {} ({}){}\n",
+                    direct_marker,
+                    result.crate_name,
+                    result.crate_version,
+                    result.path,
+                    result.kind,
+                    score_info
+                ));
+            }
+
+            if response.pagination.has_more() {
+                output.push_str(&format!(
+                    "\nUse offset={} for next page",
+                    response.pagination.next_offset()
+                ));
+            }
+        }
+
+        // Show filter hints
+        let hint_parts: Vec<String> = [
+            params.crate_filter.as_ref().map(|c| format!("crate={}", c)),
+            params.kind.as_ref().map(|k| format!("kind={}", k)),
+            if params.direct_only.unwrap_or(false) {
+                Some("direct_only=true".to_string())
+            } else {
+                None
+            },
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        if !hint_parts.is_empty() {
+            output.push_str(&format!("\nFilters: {}", hint_parts.join(", ")));
+        }
+
+        Ok(output)
     }
 
     fn where_impl(&self, name: String) -> Result<String, String> {
@@ -248,6 +427,47 @@ impl FastdepsService {
         }
         Ok(result)
     }
+
+    fn expand_impl(&self, params: ExpandParams) -> Result<String, String> {
+        let engine = SearchEngine::new(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?;
+        let crate_info = engine.get_crate_info(&params.name)?;
+
+        let mut output = String::new();
+
+        output.push_str(&format!("# {}@{}\n\n", crate_info.name, crate_info.version));
+
+        if crate_info.is_reexport {
+            output.push_str("This is a re-export/umbrella crate.\n\n");
+        }
+
+        output.push_str(&format!("Items: {}\n", crate_info.item_count));
+        output.push_str(&format!("Path: {}\n", crate_info.path));
+        output.push_str(&format!(
+            "Dependency type: {}\n\n",
+            if crate_info.is_direct_dep {
+                "direct"
+            } else {
+                "transitive"
+            }
+        ));
+
+        if !crate_info.related_crates.is_empty() {
+            output.push_str("Related crates:\n");
+            for related in &crate_info.related_crates {
+                let marker = match related.relationship {
+                    CrateRelationship::Direct => "  →",
+                    CrateRelationship::Prefix => "  ├",
+                    CrateRelationship::ReExport => "  ↪",
+                };
+                output.push_str(&format!(
+                    "{} {}@{} ({} items)\n",
+                    marker, related.name, related.version, related.item_count
+                ));
+            }
+        }
+
+        Ok(output)
+    }
 }
 
 // === Parameter structs ===
@@ -255,9 +475,17 @@ impl FastdepsService {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListParams {
     /// Filter by crate name (substring match)
+    #[schemars(description = "Filter crates by name (substring match)")]
     filter: Option<String>,
     /// Show only the latest version of each crate
+    #[schemars(description = "Show only latest version of each crate")]
     latest: Option<bool>,
+    /// Maximum results to return (default: 50)
+    #[schemars(description = "Maximum results to return")]
+    limit: Option<usize>,
+    /// Offset for pagination (default: 0)
+    #[schemars(description = "Offset for pagination")]
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -269,20 +497,64 @@ struct DepsParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PeekParams {
     /// Crate name (e.g., "serde" or "serde@1.0.200")
+    #[schemars(
+        description = "Crate name, optionally with version (e.g., 'serde' or 'serde@1.0.200')"
+    )]
     name: String,
     /// Show full details including methods and fields as JSON
+    #[schemars(description = "Return full JSON with all details")]
     full: Option<bool>,
+    /// Maximum items to return (default: 30)
+    #[schemars(description = "Maximum items to return")]
+    limit: Option<usize>,
+    /// Offset for pagination
+    #[schemars(description = "Offset for pagination")]
+    offset: Option<usize>,
+    /// Filter by item kind (struct, trait, function, enum, etc.)
+    #[schemars(
+        description = "Filter by item kind: struct, trait, function, enum, macro, constant, module"
+    )]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FindParams {
-    /// Symbol to search for (e.g., "Serialize", "spawn")
+    /// Symbol to search for (e.g., "Serialize", "spawn", "Component")
+    #[schemars(description = "Symbol name to search for. Supports fuzzy matching.")]
     query: String,
+    /// Filter to a specific crate
+    #[schemars(description = "Filter results to a specific crate")]
+    crate_filter: Option<String>,
+    /// Maximum results to return (default: 25)
+    #[schemars(description = "Maximum results to return")]
+    limit: Option<usize>,
+    /// Offset for pagination
+    #[schemars(description = "Offset for pagination")]
+    offset: Option<usize>,
+    /// Only show results from direct dependencies
+    #[schemars(description = "Only show direct dependencies (not transitive)")]
+    direct_only: Option<bool>,
+    /// Filter by item kind
+    #[schemars(description = "Filter by kind: struct, trait, function, enum, etc.")]
+    kind: Option<String>,
+    /// Enable fuzzy matching (default: true)
+    #[schemars(description = "Enable fuzzy/typo-tolerant matching")]
+    fuzzy: Option<bool>,
+    /// Show match scores in output
+    #[schemars(description = "Show relevance scores in output")]
+    show_scores: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WhereParams {
     /// Crate name (e.g., "serde" or "serde@1.0.200")
+    name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExpandParams {
+    /// Crate name to expand (e.g., "bevy" shows bevy_* crates)
+    #[schemars(description = "Crate name to expand and show related crates")]
     name: String,
 }
 
@@ -299,10 +571,19 @@ impl ServerHandler for FastdepsService {
                 website_url: None,
             },
             instructions: Some(
-                "Fastdeps provides tools to explore Rust dependency source code. \
-                 Use 'list' to see available crates, 'deps' for project dependencies, \
-                 'peek' to view a crate's API surface, 'find' to search for symbols, \
-                 and 'where' to locate crate source files."
+                "Fastdeps: Smart Rust dependency explorer with fuzzy search.\n\n\
+                 Tools:\n\
+                 - list: List project dependencies (with pagination)\n\
+                 - deps: Show Cargo.lock dependencies\n\
+                 - peek: View a crate's API (structs, traits, functions)\n\
+                 - find: Search symbols with fuzzy matching and scoring\n\
+                 - expand: Show related crates (e.g., bevy → bevy_ecs, bevy_app)\n\
+                 - where: Locate crate source on disk\n\n\
+                 Tips:\n\
+                 - Use crate_filter to narrow search to one crate\n\
+                 - Use kind filter for struct/trait/function/etc.\n\
+                 - ● = direct dependency, ○ = transitive\n\
+                 - Pagination: use limit/offset to navigate large results"
                     .to_string(),
             ),
         }
@@ -337,6 +618,11 @@ impl ServerHandler for FastdepsService {
                         cached_schema_for_type::<FindParams>(),
                     ),
                     Tool::new(
+                        "expand",
+                        "Expand a crate to show related crates (e.g., bevy → bevy_ecs)",
+                        cached_schema_for_type::<ExpandParams>(),
+                    ),
+                    Tool::new(
                         "where",
                         "Show the source path for a crate on disk",
                         cached_schema_for_type::<WhereParams>(),
@@ -365,9 +651,11 @@ impl ServerHandler for FastdepsService {
                         serde_json::from_value(args_value).unwrap_or(ListParams {
                             filter: None,
                             latest: None,
+                            limit: None,
+                            offset: None,
                         });
 
-                    match this.list_impl(params.filter, params.latest.unwrap_or(false)) {
+                    match this.list_impl(params) {
                         Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
                         Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                     }
@@ -386,7 +674,7 @@ impl ServerHandler for FastdepsService {
                         McpError::invalid_params(format!("Invalid parameters: {}", e), None)
                     })?;
 
-                    match this.peek_impl(params.name, params.full.unwrap_or(false)) {
+                    match this.peek_impl(params) {
                         Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
                         Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                     }
@@ -396,7 +684,17 @@ impl ServerHandler for FastdepsService {
                         McpError::invalid_params(format!("Invalid parameters: {}", e), None)
                     })?;
 
-                    match this.find_impl(params.query) {
+                    match this.find_impl(params) {
+                        Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+                        Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                    }
+                }
+                "expand" => {
+                    let params: ExpandParams = serde_json::from_value(args_value).map_err(|e| {
+                        McpError::invalid_params(format!("Invalid parameters: {}", e), None)
+                    })?;
+
+                    match this.expand_impl(params) {
                         Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
                         Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                     }

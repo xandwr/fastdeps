@@ -4,6 +4,7 @@ mod languages;
 mod mcp;
 mod npm;
 mod schema;
+mod search;
 
 use crate::cache::{Cache, parallel_index};
 use crate::cargo::{RegistryCrate, find_crate, resolve_project_deps};
