@@ -58,7 +58,7 @@ impl FastdepsService {
     fn list_impl(&self, filter: Option<String>, latest: bool) -> Result<String, String> {
         // List only project dependencies
         let mut crates =
-            resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?;
+            resolve_project_deps(&Utf8PathBuf::from("."), false).map_err(|e| e.to_string())?;
 
         if let Some(ref f) = filter {
             crates.retain(|c| c.name.contains(f));
@@ -91,7 +91,7 @@ impl FastdepsService {
 
     fn deps_impl(&self, path: Option<String>) -> Result<String, String> {
         let project_dir = Utf8PathBuf::from(path.unwrap_or_else(|| ".".to_string()));
-        let deps = resolve_project_deps(&project_dir).map_err(|e| e.to_string())?;
+        let deps = resolve_project_deps(&project_dir, false).map_err(|e| e.to_string())?;
 
         let result: Vec<String> = deps
             .iter()
@@ -168,7 +168,8 @@ impl FastdepsService {
     }
 
     fn find_impl(&self, query: String) -> Result<String, String> {
-        let deps = resolve_project_deps(&Utf8PathBuf::from(".")).map_err(|e| e.to_string())?;
+        let deps =
+            resolve_project_deps(&Utf8PathBuf::from("."), false).map_err(|e| e.to_string())?;
 
         // Auto-build cache if it doesn't exist
         if !Cache::exists() {

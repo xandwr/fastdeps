@@ -125,6 +125,10 @@ enum CacheAction {
         /// Re-index even if already cached
         #[arg(short, long)]
         force: bool,
+
+        /// Index all transitive dependencies, not just direct ones
+        #[arg(short, long)]
+        all: bool,
     },
     /// Show cache statistics
     Stats,
@@ -152,7 +156,7 @@ fn main() {
         Commands::ParseTs { file, module } => cmd_parse_ts(&file, &module),
         Commands::PeekTs { path, full } => cmd_peek_ts(&path, full),
         Commands::Cache { action } => match action {
-            CacheAction::Build { force } => cmd_cache_build(force),
+            CacheAction::Build { force, all } => cmd_cache_build(force, all),
             CacheAction::Stats => cmd_cache_stats(),
             CacheAction::Clear => cmd_cache_clear(),
             CacheAction::List => cmd_cache_list(),
@@ -171,7 +175,7 @@ fn main() {
 fn cmd_list(filter: Option<String>, latest: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Only list project dependencies - try Rust first (Cargo.lock), then TypeScript (package.json)
     let project_dir = Utf8PathBuf::from(".");
-    let mut crates = match resolve_project_deps(&project_dir) {
+    let mut crates = match resolve_project_deps(&project_dir, false) {
         Ok(deps) => deps,
         Err(_) => {
             // Try npm/TypeScript
@@ -235,7 +239,7 @@ fn cmd_list(filter: Option<String>, latest: bool) -> Result<(), Box<dyn std::err
 
 fn cmd_deps(path: Option<Utf8PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let project_dir = path.unwrap_or_else(|| Utf8PathBuf::from("."));
-    let deps = resolve_project_deps(&project_dir)?;
+    let deps = resolve_project_deps(&project_dir, false)?;
 
     for dep in &deps {
         println!("{}@{}", dep.name, dep.version);
@@ -316,7 +320,7 @@ fn cmd_peek(
 
 fn cmd_find(query: &str, no_cache: bool) -> Result<(), Box<dyn std::error::Error>> {
     let project_dir = Utf8PathBuf::from(".");
-    let deps = resolve_project_deps(&project_dir)?;
+    let deps = resolve_project_deps(&project_dir, false)?;
 
     // Auto-build cache if it doesn't exist (unless --no-cache)
     if !no_cache && !Cache::exists() {
@@ -490,9 +494,18 @@ fn cmd_peek_ts(path: &Utf8PathBuf, full: bool) -> Result<(), Box<dyn std::error:
 
 // === Cache commands ===
 
-fn cmd_cache_build(force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let deps = resolve_project_deps(&Utf8PathBuf::from("."))?;
-    eprintln!("Found {} dependencies", deps.len());
+fn cmd_cache_build(force: bool, all: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let direct_only = !all;
+    let deps = resolve_project_deps(&Utf8PathBuf::from("."), direct_only)?;
+
+    if direct_only {
+        eprintln!(
+            "Found {} direct dependencies (use --all for transitive)",
+            deps.len()
+        );
+    } else {
+        eprintln!("Found {} dependencies (including transitive)", deps.len());
+    }
 
     let stats = parallel_index(&deps, force).map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
@@ -556,7 +569,7 @@ fn find_specific_crate(
 ) -> Result<RegistryCrate, Box<dyn std::error::Error>> {
     // First, check project path dependencies if a project dir is provided
     if let Some(proj_dir) = project_dir {
-        let deps = resolve_project_deps(proj_dir)?;
+        let deps = resolve_project_deps(proj_dir, false)?;
         for dep in deps {
             if dep.name == name {
                 if let Some(v) = version {

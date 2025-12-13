@@ -189,6 +189,41 @@ struct CargoToml {
     build_dependencies: Option<toml::Table>,
 }
 
+/// Get the names of all direct dependencies from Cargo.toml.
+/// Returns dependency names from [dependencies], [dev-dependencies], and [build-dependencies].
+pub fn get_direct_dep_names(
+    project_dir: &Utf8Path,
+) -> Result<std::collections::HashSet<String>, CargoError> {
+    let toml_path = project_dir.join("Cargo.toml");
+    if !toml_path.exists() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let contents = fs::read_to_string(&toml_path).map_err(|e| CargoError::ReadError {
+        path: toml_path.clone(),
+        source: e,
+    })?;
+
+    let manifest: CargoToml = toml::from_str(&contents).map_err(|e| CargoError::TomlError {
+        path: toml_path,
+        source: e,
+    })?;
+
+    let mut direct_deps = std::collections::HashSet::new();
+
+    if let Some(deps) = &manifest.dependencies {
+        direct_deps.extend(deps.keys().cloned());
+    }
+    if let Some(deps) = &manifest.dev_dependencies {
+        direct_deps.extend(deps.keys().cloned());
+    }
+    if let Some(deps) = &manifest.build_dependencies {
+        direct_deps.extend(deps.keys().cloned());
+    }
+
+    Ok(direct_deps)
+}
+
 /// Locked dependency from Cargo.lock.
 #[derive(Debug, Clone)]
 pub struct LockedDep {
@@ -306,12 +341,32 @@ pub fn parse_cargo_lock(project_dir: &Utf8Path) -> Result<Vec<LockedDep>, CargoE
 
 /// Get all dependencies for a project with their paths.
 /// Includes both registry crates and local path dependencies.
-pub fn resolve_project_deps(project_dir: &Utf8Path) -> Result<Vec<RegistryCrate>, CargoError> {
+///
+/// If `direct_only` is true, only returns direct dependencies listed in Cargo.toml
+/// (not transitive dependencies of dependencies).
+pub fn resolve_project_deps(
+    project_dir: &Utf8Path,
+    direct_only: bool,
+) -> Result<Vec<RegistryCrate>, CargoError> {
     let locked = parse_cargo_lock(project_dir)?;
     let registry = list_registry_crates()?;
 
+    // Get direct dependency names if filtering
+    let direct_deps = if direct_only {
+        Some(get_direct_dep_names(project_dir)?)
+    } else {
+        None
+    };
+
     let mut resolved = Vec::new();
     for dep in locked {
+        // Skip if not a direct dependency (when filtering)
+        if let Some(ref direct) = direct_deps {
+            if !direct.contains(&dep.name) {
+                continue;
+            }
+        }
+
         // Path dependency - use the path directly
         if let Some(path) = dep.path {
             resolved.push(RegistryCrate {
