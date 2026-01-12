@@ -1,6 +1,7 @@
 mod db;
 mod embed;
 mod parse;
+mod profile;
 mod project;
 mod usage;
 
@@ -55,6 +56,21 @@ fn main() {
             }
             let project = require_project();
             cmd_explain(&project, &symbol);
+        }
+        Some("profile") => {
+            // Show octonion profile for a crate
+            let crate_name = args.get(2).map(|s| s.as_str());
+            if crate_name.is_none() {
+                eprintln!("usage: cratefind profile <crate_name>");
+                std::process::exit(1);
+            }
+            let project = require_project();
+            cmd_profile(&project, crate_name.unwrap());
+        }
+        Some("octo-search") => {
+            // Experimental octonion-based search
+            let project = require_project();
+            cmd_octo_search(&project, &args[2..]);
         }
         _ => {
             eprintln!("cratefind - Understand your Rust dependencies like a senior engineer");
@@ -329,6 +345,169 @@ fn cmd_usage(project: &project::RustProject, crate_name: &str) {
             eprintln!("Failed to analyze usage: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+fn cmd_profile(project: &project::RustProject, crate_name: &str) {
+    // Find the version of this crate in the project
+    let dep = project.deps.iter().find(|d| d.name == crate_name);
+
+    let version = match dep {
+        Some(d) => d.version.clone(),
+        None => {
+            eprintln!("Crate '{}' not found in project dependencies.", crate_name);
+            std::process::exit(1);
+        }
+    };
+
+    // Find source directory
+    let source_dir = match parse::find_crate_source(crate_name, &version) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("Failed to find crate source: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("Profiling {}@{} ...", crate_name, version);
+    println!();
+
+    match profile::CrateProfile::from_source(crate_name, &version, &source_dir) {
+        Ok(p) => {
+            println!("Raw metrics:");
+            println!("  Lines of code: {}", p.raw.total_loc);
+            println!(
+                "  Functions: {} ({} async)",
+                p.raw.total_fns, p.raw.async_fns
+            );
+            println!("  Unsafe blocks: {}", p.raw.unsafe_blocks);
+            println!("  Send/Sync impls: {}", p.raw.send_sync_count);
+            println!("  Heap types: {}", p.raw.heap_types);
+            println!("  Dependencies: {}", p.raw.dep_count);
+            println!("  no_std: {}", p.raw.is_no_std);
+            println!();
+
+            let c = profile::octonion_coeffs(&p.octonion);
+            println!("Octonion profile:");
+            println!("  e0 (utility):     {:.3}", c[0]);
+            println!("  e1 (concurrency): {:.3}", c[1]);
+            println!("  e2 (safety):      {:.3}", c[2]);
+            println!("  e3 (async):       {:.3}", c[3]);
+            println!("  e4 (memory):      {:.3}", c[4]);
+            println!("  e5 (friction):    {:.3}", c[5]);
+            println!("  e6 (environment): {:.3}", c[6]);
+            println!("  e7 (entropy):     {:.3}", c[7]);
+            println!();
+
+            // Test against some sample queries
+            println!("Sample query scores:");
+
+            let q_async = profile::query_octonion(true, true, false, true, true);
+            println!(
+                "  'async + send/sync + safe + light': {:.3}",
+                p.combined_score(&q_async)
+            );
+
+            let q_nostd = profile::query_octonion(false, false, true, true, true);
+            println!(
+                "  'no_std + safe + light':            {:.3}",
+                p.combined_score(&q_nostd)
+            );
+
+            let q_simple = profile::query_octonion(false, false, false, false, false);
+            println!(
+                "  'just utility':                     {:.3}",
+                p.combined_score(&q_simple)
+            );
+        }
+        Err(e) => {
+            eprintln!("Failed to profile crate: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_octo_search(project: &project::RustProject, args: &[String]) {
+    // Parse flags
+    let mut wants_async = false;
+    let mut wants_sync = false;
+    let mut wants_nostd = false;
+    let mut prefers_safe = false;
+    let mut prefers_light = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--async" => wants_async = true,
+            "--sync" => wants_sync = true,
+            "--no-std" => wants_nostd = true,
+            "--safe" => prefers_safe = true,
+            "--light" => prefers_light = true,
+            _ => {}
+        }
+    }
+
+    if args.is_empty() {
+        eprintln!("usage: cratefind octo-search [--async] [--sync] [--no-std] [--safe] [--light]");
+        eprintln!();
+        eprintln!("Flags:");
+        eprintln!("  --async    Prefer async-ready crates");
+        eprintln!("  --sync     Prefer Send+Sync crates");
+        eprintln!("  --no-std   Prefer no_std compatible crates");
+        eprintln!("  --safe     Avoid crates with lots of unsafe");
+        eprintln!("  --light    Prefer crates with few dependencies");
+        std::process::exit(1);
+    }
+
+    let query = profile::query_octonion(
+        wants_async,
+        wants_sync,
+        wants_nostd,
+        prefers_safe,
+        prefers_light,
+    );
+
+    println!("Query octonion:");
+    println!(
+        "  async={}, sync={}, no_std={}, safe={}, light={}",
+        wants_async, wants_sync, wants_nostd, prefers_safe, prefers_light
+    );
+    println!();
+
+    // Profile all dependencies and rank them
+    let mut scores: Vec<(String, String, f32, f32, f32)> = Vec::new();
+
+    for dep in &project.deps {
+        if let Ok(source_dir) = parse::find_crate_source(&dep.name, &dep.version) {
+            if let Ok(p) = profile::CrateProfile::from_source(&dep.name, &dep.version, &source_dir)
+            {
+                let (sim, friction) = p.score(&query);
+                let combined = p.combined_score(&query);
+                scores.push((
+                    dep.name.clone(),
+                    dep.version.clone(),
+                    sim,
+                    friction,
+                    combined,
+                ));
+            }
+        }
+    }
+
+    // Sort by combined score
+    scores.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap());
+
+    println!("Top matches:");
+    println!("{:<30} {:>8} {:>8} {:>8}", "CRATE", "SIM", "FRIC", "SCORE");
+    println!("{}", "-".repeat(58));
+
+    for (name, version, sim, friction, combined) in scores.iter().take(15) {
+        println!(
+            "{:<30} {:>8.3} {:>8.3} {:>8.3}",
+            format!("{}@{}", name, version),
+            sim,
+            friction,
+            combined
+        );
     }
 }
 
