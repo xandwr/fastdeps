@@ -1,9 +1,4 @@
-mod db;
-mod embed;
-mod parse;
-mod profile;
-mod project;
-mod usage;
+use cratefind::{db, embed, octo_index, parse, profile, project, usage};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -72,6 +67,14 @@ fn main() {
             let project = require_project();
             cmd_octo_search(&project, &args[2..]);
         }
+        Some("octo-index") => {
+            // Search the pre-built Octo-Index
+            cmd_octo_index(&args[2..]);
+        }
+        Some("octo-lookup") => {
+            // Lookup a crate in the Octo-Index
+            cmd_octo_lookup(&args[2..]);
+        }
         _ => {
             eprintln!("cratefind - Understand your Rust dependencies like a senior engineer");
             eprintln!();
@@ -86,12 +89,20 @@ fn main() {
             eprintln!("  explain <path>   Explain a symbol with context");
             eprintln!("  stats            Show index statistics");
             eprintln!();
+            eprintln!("OCTO-INDEX COMMANDS:");
+            eprintln!("  octo-index [FLAGS] [--file <path>]");
+            eprintln!("                   Search top crates using pre-built octonion index");
+            eprintln!("  octo-lookup <crate> [--file <path>]");
+            eprintln!("                   Look up a crate's octonion profile");
+            eprintln!();
             eprintln!("EXAMPLES:");
             eprintln!("  cratefind index");
             eprintln!("  cratefind search \"serialize to json\"");
             eprintln!("  cratefind learn serde");
             eprintln!("  cratefind usage anyhow");
             eprintln!("  cratefind explain serde::de::DeserializeOwned");
+            eprintln!("  cratefind octo-index --async --safe --file octo-index.bin");
+            eprintln!("  cratefind octo-lookup tokio --file octo-index.bin");
             std::process::exit(1);
         }
     }
@@ -587,5 +598,223 @@ fn cmd_explain(project: &project::RustProject, symbol_query: &str) {
             println!("   {}", sig);
         }
         println!();
+    }
+}
+
+fn cmd_octo_index(args: &[String]) {
+    // Parse flags
+    let mut wants_async = false;
+    let mut wants_sync = false;
+    let mut wants_nostd = false;
+    let mut prefers_safe = false;
+    let mut prefers_light = false;
+    let mut index_file: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--async" => wants_async = true,
+            "--sync" => wants_sync = true,
+            "--no-std" => wants_nostd = true,
+            "--safe" => prefers_safe = true,
+            "--light" => prefers_light = true,
+            "--file" | "-f" => {
+                if i + 1 < args.len() {
+                    index_file = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Load the index
+    let index = match &index_file {
+        Some(path) => match octo_index::OctoIndex::load(std::path::Path::new(path)) {
+            Ok(idx) => idx,
+            Err(e) => {
+                eprintln!("Failed to load Octo-Index from {}: {}", path, e);
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!("No index file specified. Use --file <path> to specify the Octo-Index file.");
+            eprintln!();
+            eprintln!("To generate an index, run:");
+            eprintln!(
+                "  cargo run --bin octo-sleeper -- --db-dump ./db-dump/<date> -o octo-index.bin"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if !wants_async && !wants_sync && !wants_nostd && !prefers_safe && !prefers_light {
+        // No flags specified - show top crates by utility
+        println!("Octo-Index: {} crates indexed", index.count);
+        println!();
+        println!("Top crates by utility score:");
+        println!("{:<30} {:>10} {:>10}", "CRATE", "VERSION", "UTILITY");
+        println!("{}", "-".repeat(52));
+
+        for profile in index.top_by_utility(20) {
+            println!(
+                "{:<30} {:>10} {:>10.3}",
+                profile.name, profile.version, profile.coeffs[0]
+            );
+        }
+        return;
+    }
+
+    // Build query and search
+    let query = octo_index::build_query(
+        wants_async,
+        wants_sync,
+        wants_nostd,
+        prefers_safe,
+        prefers_light,
+    );
+
+    println!("Query:");
+    println!(
+        "  async={}, sync={}, no_std={}, safe={}, light={}",
+        wants_async, wants_sync, wants_nostd, prefers_safe, prefers_light
+    );
+    println!();
+
+    let results = index.search(&query, 20);
+
+    println!("Top matches from {} crates:", index.count);
+    println!(
+        "{:<30} {:>10} {:>8} {:>8} {:>8} {:>8}",
+        "CRATE", "VERSION", "SCORE", "e0", "e3", "e6"
+    );
+    println!("{}", "-".repeat(80));
+
+    for (profile, score) in results {
+        println!(
+            "{:<30} {:>10} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            profile.name,
+            profile.version,
+            score,
+            profile.coeffs[0], // utility
+            profile.coeffs[3], // async
+            profile.coeffs[6], // no_std
+        );
+    }
+}
+
+fn cmd_octo_lookup(args: &[String]) {
+    // Parse arguments
+    let mut crate_name: Option<String> = None;
+    let mut index_file: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" | "-f" => {
+                if i + 1 < args.len() {
+                    index_file = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            s if !s.starts_with('-') && crate_name.is_none() => {
+                crate_name = Some(s.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let crate_name = match crate_name {
+        Some(n) => n,
+        None => {
+            eprintln!("usage: cratefind octo-lookup <crate_name> --file <path>");
+            std::process::exit(1);
+        }
+    };
+
+    // Load the index
+    let index = match &index_file {
+        Some(path) => match octo_index::OctoIndex::load(std::path::Path::new(path)) {
+            Ok(idx) => idx,
+            Err(e) => {
+                eprintln!("Failed to load Octo-Index from {}: {}", path, e);
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!("No index file specified. Use: cratefind octo-lookup <crate> --file <path>");
+            std::process::exit(1);
+        }
+    };
+
+    match index.get(&crate_name) {
+        Some(profile) => {
+            println!("Octonion Profile: {}@{}", profile.name, profile.version);
+            println!();
+            println!("Dimensions:");
+            println!(
+                "  e0 (utility):     {:.3}  (downloads/age)",
+                profile.coeffs[0]
+            );
+            println!(
+                "  e1 (concurrency): {:.3}  (Send/Sync impls)",
+                profile.coeffs[1]
+            );
+            println!(
+                "  e2 (safety):      {:.3}  (unsafe density)",
+                profile.coeffs[2]
+            );
+            println!(
+                "  e3 (async):       {:.3}  (async fn ratio)",
+                profile.coeffs[3]
+            );
+            println!(
+                "  e4 (memory):      {:.3}  (heap allocations)",
+                profile.coeffs[4]
+            );
+            println!(
+                "  e5 (friction):    {:.3}  (dependency count)",
+                profile.coeffs[5]
+            );
+            println!("  e6 (environment): {:.3}  (no_std)", profile.coeffs[6]);
+            println!(
+                "  e7 (entropy):     {:.3}  (version volatility)",
+                profile.coeffs[7]
+            );
+            println!();
+            println!("Raw metrics:");
+            println!("  Downloads:    {}", profile.raw.downloads);
+            println!("  Age (days):   {}", profile.raw.age_days);
+            println!("  Versions:     {}", profile.raw.version_count);
+            println!("  LoC:          {}", profile.raw.total_loc);
+            println!(
+                "  Functions:    {} ({} async)",
+                profile.raw.total_fns, profile.raw.async_fns
+            );
+            println!("  Unsafe:       {}", profile.raw.unsafe_blocks);
+            println!("  Send/Sync:    {}", profile.raw.send_sync_count);
+            println!("  Dependencies: {}", profile.raw.dep_count);
+            println!("  no_std:       {}", profile.raw.is_no_std);
+        }
+        None => {
+            eprintln!("Crate '{}' not found in Octo-Index.", crate_name);
+            eprintln!();
+            // Suggest similar names
+            let matches: Vec<_> = index
+                .profiles
+                .keys()
+                .filter(|k| k.contains(&crate_name) || crate_name.contains(k.as_str()))
+                .take(5)
+                .collect();
+            if !matches.is_empty() {
+                eprintln!("Did you mean one of these?");
+                for name in matches {
+                    eprintln!("  {}", name);
+                }
+            }
+            std::process::exit(1);
+        }
     }
 }
