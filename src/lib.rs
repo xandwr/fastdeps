@@ -3,6 +3,7 @@
 //! This library provides tools for semantic search, octonion-based profiling,
 //! and static analysis of Rust crates.
 
+pub mod braid;
 pub mod contrastive;
 pub mod db;
 pub mod embed;

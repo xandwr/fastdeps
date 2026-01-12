@@ -614,6 +614,223 @@ fn type_to_string(ty: &Type) -> String {
     }
 }
 
+// =============================================================================
+// Trait Bound Extraction for Braid Analysis
+// =============================================================================
+
+use crate::braid::crossing::{ExtractedBounds, Ternary};
+
+/// Extract trait bounds from a crate's public API for braid analysis.
+pub fn extract_bounds(name: &str, version: &str) -> Result<ExtractedBounds> {
+    let source_dir = find_crate_source(name, version)?;
+    let mut bounds = ExtractedBounds::default();
+
+    // Find the lib.rs entry point
+    let lib_rs = source_dir.join("src/lib.rs");
+    let main_entry = if lib_rs.exists() {
+        lib_rs
+    } else {
+        let root_lib = source_dir.join("lib.rs");
+        if root_lib.exists() {
+            root_lib
+        } else {
+            source_dir.join("src/main.rs")
+        }
+    };
+
+    if main_entry.exists() {
+        extract_bounds_from_file(&main_entry, &mut bounds)?;
+    }
+
+    // Also check src directory
+    let src_dir = source_dir.join("src");
+    if src_dir.exists() {
+        extract_bounds_from_dir(&src_dir, &mut bounds)?;
+    }
+
+    Ok(bounds)
+}
+
+fn extract_bounds_from_dir(dir: &Path, bounds: &mut ExtractedBounds) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() && path.extension().map(|e| e == "rs").unwrap_or(false) {
+            let _ = extract_bounds_from_file(&path, bounds);
+        } else if path.is_dir() {
+            let _ = extract_bounds_from_dir(&path, bounds);
+        }
+    }
+    Ok(())
+}
+
+fn extract_bounds_from_file(path: &Path, bounds: &mut ExtractedBounds) -> Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let syntax = syn::parse_file(&content).context("Failed to parse")?;
+
+    for item in &syntax.items {
+        extract_bounds_from_item(item, bounds);
+    }
+
+    Ok(())
+}
+
+fn extract_bounds_from_item(item: &Item, bounds: &mut ExtractedBounds) {
+    match item {
+        Item::Trait(t) if is_public(&t.vis) => {
+            // Record the trait itself
+            let trait_name = t.ident.to_string();
+            bounds.trait_bounds.insert(trait_name.clone());
+
+            // Check for marker trait indicators in supertraits
+            for bound in &t.supertraits {
+                if let syn::TypeParamBound::Trait(tb) = bound {
+                    let bound_name = trait_bound_to_string(tb);
+                    if bound_name.contains("Send") {
+                        bounds.markers.send = Ternary::Yes;
+                    }
+                    if bound_name.contains("Sync") {
+                        bounds.markers.sync = Ternary::Yes;
+                    }
+                    if bound_name.contains("Unpin") {
+                        bounds.markers.unpin = Ternary::Yes;
+                    }
+                    bounds.trait_bounds.insert(bound_name);
+                }
+            }
+        }
+
+        Item::Struct(s) if is_public(&s.vis) => {
+            let name = s.ident.to_string();
+            // Check for wrapper patterns
+            if is_wrapper_type(&name) {
+                bounds.wrappers.push(name);
+            }
+
+            // Check generic bounds
+            extract_generic_bounds(&s.generics, bounds);
+        }
+
+        Item::Impl(i) => {
+            // Check for Send/Sync/Unpin implementations
+            if let Some((_, trait_path, _)) = &i.trait_ {
+                let trait_name = path_to_string(trait_path);
+
+                // Negative impls (!Send, !Sync)
+                let is_negative = i.unsafety.is_some() && trait_name.contains("!");
+
+                if trait_name.contains("Send") {
+                    bounds.markers.send = if is_negative {
+                        Ternary::No
+                    } else {
+                        Ternary::Yes
+                    };
+                }
+                if trait_name.contains("Sync") {
+                    bounds.markers.sync = if is_negative {
+                        Ternary::No
+                    } else {
+                        Ternary::Yes
+                    };
+                }
+                if trait_name.contains("Unpin") {
+                    bounds.markers.unpin = if is_negative {
+                        Ternary::No
+                    } else {
+                        Ternary::Yes
+                    };
+                }
+
+                bounds.trait_bounds.insert(trait_name);
+            }
+        }
+
+        Item::Fn(f) if is_public(&f.vis) => {
+            // Check return type for async indicators
+            if f.sig.asyncness.is_some() {
+                bounds.trait_bounds.insert("Future".to_string());
+            }
+
+            // Check generic bounds on functions
+            extract_generic_bounds(&f.sig.generics, bounds);
+        }
+
+        Item::Mod(m) if is_public(&m.vis) => {
+            if let Some((_, items)) = &m.content {
+                for item in items {
+                    extract_bounds_from_item(item, bounds);
+                }
+            }
+        }
+
+        _ => {}
+    }
+}
+
+fn extract_generic_bounds(generics: &syn::Generics, bounds: &mut ExtractedBounds) {
+    // From type parameters
+    for param in &generics.params {
+        if let GenericParam::Type(tp) = param {
+            for bound in &tp.bounds {
+                if let syn::TypeParamBound::Trait(tb) = bound {
+                    let bound_name = trait_bound_to_string(tb);
+                    bounds.trait_bounds.insert(bound_name);
+                }
+            }
+        }
+    }
+
+    // From where clause
+    if let Some(where_clause) = &generics.where_clause {
+        for pred in &where_clause.predicates {
+            if let syn::WherePredicate::Type(pt) = pred {
+                for bound in &pt.bounds {
+                    if let syn::TypeParamBound::Trait(tb) = bound {
+                        let bound_name = trait_bound_to_string(tb);
+
+                        // Track marker traits
+                        if bound_name.contains("Send") {
+                            bounds.markers.send = Ternary::Yes;
+                        }
+                        if bound_name.contains("Sync") {
+                            bounds.markers.sync = Ternary::Yes;
+                        }
+
+                        bounds.trait_bounds.insert(bound_name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn trait_bound_to_string(tb: &syn::TraitBound) -> String {
+    path_to_string(&tb.path)
+}
+
+fn path_to_string(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn is_wrapper_type(name: &str) -> bool {
+    name.contains("Wrapper")
+        || name.contains("Adapter")
+        || name.contains("Guard")
+        || name.contains("Lock")
+        || name.contains("Ref")
+        || name.ends_with("Box")
+        || name.ends_with("Arc")
+        || name.ends_with("Rc")
+        || name.contains("Pin")
+        || name.contains("Cell")
+        || name.contains("Mutex")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

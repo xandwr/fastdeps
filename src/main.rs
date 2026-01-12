@@ -1,4 +1,4 @@
-use cratefind::{contrastive, db, embed, octo_index, parse, profile, project, usage};
+use cratefind::{braid, contrastive, db, embed, octo_index, parse, profile, project, usage};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -91,6 +91,11 @@ fn main() {
             }
             cmd_semantic_search(&query, &args[2..]);
         }
+        Some("braid-check") => {
+            // Braid analysis for dependency tangles
+            let project = require_project();
+            cmd_braid_check(&project, &args[2..]);
+        }
         _ => {
             eprintln!("cratefind - Understand your Rust dependencies like a senior engineer");
             eprintln!();
@@ -116,6 +121,10 @@ fn main() {
             eprintln!("                   Train a 384×8 linear mapper from crate descriptions");
             eprintln!("  semantic-search <query> --mapper <path> --octo-index <path>");
             eprintln!("                   Natural language search using trained mapper");
+            eprintln!();
+            eprintln!("BRAID ANALYSIS:");
+            eprintln!("  braid-check      Analyze dependency graph for topological tangles");
+            eprintln!("                   Detects async runtime conflicts, Send/Sync mismatches");
             eprintln!();
             eprintln!("EXAMPLES:");
             eprintln!("  cratefind index");
@@ -1119,4 +1128,215 @@ fn cmd_semantic_search(query: &str, args: &[String]) {
             profile.name, profile.version, score
         );
     }
+}
+
+fn cmd_braid_check(project: &project::RustProject, _args: &[String]) {
+    println!("Braid Analysis: {}", project.name);
+    println!("{} dependencies", project.deps.len());
+    println!();
+
+    // Build braid word from dependencies
+    let deps_with_profiles: Vec<(String, Option<octo_index::OctonionProfile>)> = project
+        .deps
+        .iter()
+        .map(|dep| {
+            let profile = parse::find_crate_source(&dep.name, &dep.version)
+                .ok()
+                .and_then(|source_dir| {
+                    profile::CrateProfile::from_source(&dep.name, &dep.version, &source_dir).ok()
+                })
+                .map(|cp| {
+                    let coeffs_f64 = profile::octonion_coeffs(&cp.octonion);
+                    let coeffs: [f32; 8] = [
+                        coeffs_f64[0] as f32,
+                        coeffs_f64[1] as f32,
+                        coeffs_f64[2] as f32,
+                        coeffs_f64[3] as f32,
+                        coeffs_f64[4] as f32,
+                        coeffs_f64[5] as f32,
+                        coeffs_f64[6] as f32,
+                        coeffs_f64[7] as f32,
+                    ];
+                    octo_index::OctonionProfile {
+                        name: dep.name.clone(),
+                        version: dep.version.clone(),
+                        coeffs,
+                        raw: octo_index::RawMetrics::default(),
+                    }
+                });
+            (dep.name.clone(), profile)
+        })
+        .collect();
+
+    let word = braid::BraidWord::from_deps(&deps_with_profiles);
+
+    println!("Braid word: {} generators", word.generators.len());
+    if word.generators.len() <= 10 {
+        println!("  {}", word.to_named_string());
+    } else {
+        // Show first 5 and last 5
+        let first: Vec<_> = word
+            .generators
+            .iter()
+            .take(5)
+            .map(|g| g.name.clone())
+            .collect();
+        let last: Vec<_> = word
+            .generators
+            .iter()
+            .rev()
+            .take(5)
+            .rev()
+            .map(|g| g.name.clone())
+            .collect();
+        println!("  {} → ... → {}", first.join(" → "), last.join(" → "));
+    }
+    println!();
+
+    // Find tangle points
+    let tangles = word.find_tangle_points();
+    if !tangles.is_empty() {
+        println!("Potential tangle points detected: {}", tangles.len());
+        for &pos in tangles.iter().take(5) {
+            if pos + 2 < word.generators.len() {
+                let a = &word.generators[pos];
+                let b = &word.generators[pos + 1];
+                let c = &word.generators[pos + 2];
+                println!("  Position {}: {} ↔ {} ↔ {}", pos, a.name, b.name, c.name);
+            }
+        }
+        println!();
+    }
+
+    // Extract trait bounds and check for crossings
+    println!("Analyzing trait bounds...");
+    let mut bounds_cache: std::collections::HashMap<String, braid::crossing::ExtractedBounds> =
+        std::collections::HashMap::new();
+
+    // Extract bounds for each dependency (limited to first 20 for speed)
+    for dep in project.deps.iter().take(20) {
+        if let Ok(bounds) = parse::extract_bounds(&dep.name, &dep.version) {
+            bounds_cache.insert(dep.name.clone(), bounds);
+        }
+    }
+
+    println!("  Extracted bounds from {} crates", bounds_cache.len());
+    println!();
+
+    // Check for crossings between async crates
+    let async_crates: Vec<_> = bounds_cache
+        .iter()
+        .filter(|(_, b)| b.is_async())
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if async_crates.len() > 1 {
+        println!("Async crates detected ({}):", async_crates.len());
+        for name in &async_crates {
+            println!("  {}", name);
+        }
+        println!();
+
+        // Check for conflicts between async crates
+        println!("Checking for async crossing conflicts...");
+        let mut conflicts_found = 0;
+
+        for i in 0..async_crates.len() {
+            for j in (i + 1)..async_crates.len() {
+                let name_a = &async_crates[i];
+                let name_b = &async_crates[j];
+
+                let bounds_a = &bounds_cache[name_a];
+                let bounds_b = &bounds_cache[name_b];
+
+                let crossings =
+                    braid::crossing::detect_crossings_heuristic(name_a, bounds_a, name_b, bounds_b);
+
+                if !crossings.is_empty() {
+                    conflicts_found += 1;
+                    println!();
+                    println!("  Crossing: {} ↔ {}", name_a, name_b);
+                    for crossing in &crossings {
+                        println!("    {}", crossing.describe());
+                    }
+
+                    // Get profiles for deeper analysis
+                    let profile_a = deps_with_profiles
+                        .iter()
+                        .find(|(n, _)| n == name_a)
+                        .and_then(|(_, p)| p.as_ref());
+                    let profile_b = deps_with_profiles
+                        .iter()
+                        .find(|(n, _)| n == name_b)
+                        .and_then(|(_, p)| p.as_ref());
+
+                    if let (Some(pa), Some(pb)) = (profile_a, profile_b) {
+                        // Check Fano compatibility
+                        let fano_score = braid::fano::check_all_lines(&pa.coeffs, &pb.coeffs);
+                        println!("    Fano compatibility: {:.2}", fano_score);
+
+                        // Check octonion parity
+                        let parity = braid::fano::octonion_parity(&pa.coeffs, &pb.coeffs);
+                        match parity {
+                            braid::fano::OctonionParity::Real { confidence } => {
+                                println!(
+                                    "    Octonion parity: REAL (confidence: {:.2})",
+                                    confidence
+                                );
+                                println!("    → Crossing may be resolvable with a shim");
+                            }
+                            braid::fano::OctonionParity::Imaginary { residue } => {
+                                println!(
+                                    "    Octonion parity: IMAGINARY (residue: {:.2})",
+                                    residue
+                                );
+                                println!("    → Essential tangle - may need architectural change");
+                            }
+                        }
+
+                        // Analyze crossing
+                        for crossing in &crossings {
+                            let analysis = braid::analyze_crossing(pa, pb, crossing);
+                            match analysis {
+                                braid::CrossingAnalysis::Clean => {
+                                    println!("    Analysis: Clean crossing");
+                                }
+                                braid::CrossingAnalysis::Resolvable {
+                                    template,
+                                    fano_match,
+                                } => {
+                                    println!(
+                                        "    Analysis: Resolvable via '{}' template (fano={:.2})",
+                                        template, fano_match
+                                    );
+                                }
+                                braid::CrossingAnalysis::Essential {
+                                    conflict,
+                                    suggestion,
+                                } => {
+                                    println!("    Analysis: ESSENTIAL TANGLE");
+                                    println!("      Conflict: {}", conflict.description);
+                                    println!("      Suggestion: {}", suggestion);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if conflicts_found == 0 {
+            println!("  No crossing conflicts detected between async crates.");
+        }
+    } else if async_crates.len() == 1 {
+        println!(
+            "Single async crate: {} - no runtime conflicts possible",
+            async_crates[0]
+        );
+    } else {
+        println!("No async crates detected in dependencies.");
+    }
+
+    println!();
+    println!("Braid analysis complete.");
 }
