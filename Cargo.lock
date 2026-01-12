@@ -335,6 +335,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "rusqlite",
+ "syn",
 ]
 
 [[package]]

@@ -227,6 +227,76 @@ impl Database {
         Ok(results)
     }
 
+    /// Search by path substring (for exact/partial matches)
+    pub fn search_by_path(
+        &self,
+        path_query: &str,
+        crate_ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, rusqlite::Error> {
+        if crate_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build numbered placeholders starting from ?3 for crate_ids
+        let placeholders: Vec<String> = (0..crate_ids.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect();
+        let in_clause = placeholders.join(",");
+
+        // Use LIKE for substring matching, with exact matches ranked higher
+        let sql = format!(
+            "SELECT s.path, s.kind, s.signature, c.name, c.version,
+                    CASE
+                        WHEN s.path = ?1 THEN 3
+                        WHEN s.path LIKE ?1 || '%' THEN 2
+                        WHEN s.path LIKE '%' || ?1 || '%' THEN 1
+                        ELSE 0
+                    END as rank
+             FROM symbols s
+             JOIN crates c ON s.crate_id = c.id
+             WHERE s.crate_id IN ({in_clause})
+               AND s.path LIKE '%' || ?1 || '%'
+             ORDER BY rank DESC, length(s.path) ASC
+             LIMIT ?2"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        // Build params: ?1=path_query, ?2=limit, ?3..=crate_ids
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        params_vec.push(Box::new(path_query.to_string()));
+        params_vec.push(Box::new(limit as i64));
+        for id in crate_ids {
+            params_vec.push(Box::new(*id));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
+
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            let path: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let signature: Option<String> = row.get(2)?;
+            let crate_name: String = row.get(3)?;
+            let crate_version: String = row.get(4)?;
+            let rank: i32 = row.get(5)?;
+
+            Ok(SearchResult {
+                crate_name,
+                crate_version,
+                path,
+                kind,
+                signature,
+                score: rank as f32,
+            })
+        })?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Get database statistics
     pub fn stats(&self) -> Result<Stats, rusqlite::Error> {
         let crate_count: i64 = self

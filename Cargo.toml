@@ -8,3 +8,4 @@ anyhow = "1"
 dirs = "6"
 fastembed = "5.8.0"
 rusqlite = { version = "0.35", features = ["bundled"] }
+syn = { version = "2", features = ["full", "parsing"] }
