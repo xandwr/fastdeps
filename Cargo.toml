@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+dirs = "6"
 fastembed = "5.8.0"
+rusqlite = { version = "0.35", features = ["bundled"] }

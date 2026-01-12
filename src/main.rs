@@ -1,70 +1,145 @@
-use fastembed::{
-    Pooling, QuantizationMode, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
-};
+mod db;
+mod embed;
+mod project;
 
 fn main() {
-    // Bake model into binary at compile time (~23MB)
-    #[cfg(target_arch = "aarch64")]
-    let onnx_bytes = include_bytes!("../models/all-MiniLM-L6-v2/model-arm64.onnx");
-    #[cfg(not(target_arch = "aarch64"))]
-    let onnx_bytes = include_bytes!("../models/all-MiniLM-L6-v2/model.onnx");
+    let args: Vec<String> = std::env::args().collect();
 
-    let model_data = UserDefinedEmbeddingModel {
-        onnx_file: onnx_bytes.to_vec(),
-        tokenizer_files: TokenizerFiles {
-            tokenizer_file: include_bytes!("../models/all-MiniLM-L6-v2/tokenizer.json").to_vec(),
-            config_file: include_bytes!("../models/all-MiniLM-L6-v2/config.json").to_vec(),
-            special_tokens_map_file: include_bytes!(
-                "../models/all-MiniLM-L6-v2/special_tokens_map.json"
-            )
-            .to_vec(),
-            tokenizer_config_file: include_bytes!(
-                "../models/all-MiniLM-L6-v2/tokenizer_config.json"
-            )
-            .to_vec(),
-        },
-        pooling: Some(Pooling::Mean),
-        quantization: QuantizationMode::None,
-        output_key: Default::default(), // OnlyOne - model has single output
+    // Must be in a Rust project
+    let project = match project::RustProject::discover() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!("hint: run this from a Rust project directory (with Cargo.toml)");
+            std::process::exit(1);
+        }
     };
 
-    let mut model = TextEmbedding::try_new_from_user_defined(model_data, Default::default())
-        .expect("Failed to load embedding model");
-
-    // Test it
-    let texts = vec![
-        "spawn children in bevy",
-        "ChildSpawnerCommands",
-        "EntityCommands with_children",
-        "serialize json data",
-        "serde Serialize trait",
-    ];
-
-    let embeddings = model.embed(texts.clone(), None).expect("Embedding failed");
-
-    println!("Generated {} embeddings of dimension {}", embeddings.len(), embeddings[0].len());
-
-    // Show similarity matrix
-    println!("\nSimilarity matrix:");
-    print!("{:30}", "");
-    for (i, _) in texts.iter().enumerate() {
-        print!("{:>6}", i);
-    }
-    println!();
-
-    for (i, t1) in texts.iter().enumerate() {
-        print!("{:30}", if t1.len() > 28 { &t1[..28] } else { t1 });
-        for (j, _) in texts.iter().enumerate() {
-            let sim = cosine_similarity(&embeddings[i], &embeddings[j]);
-            print!("{:6.2}", sim);
+    match args.get(1).map(|s| s.as_str()) {
+        Some("index") => cmd_index(&project),
+        Some("search") => {
+            let query = args[2..].join(" ");
+            if query.is_empty() {
+                eprintln!("usage: cratefind search <query>");
+                std::process::exit(1);
+            }
+            cmd_search(&project, &query);
         }
-        println!();
+        Some("stats") => cmd_stats(&project),
+        _ => {
+            eprintln!("usage: cratefind <command>");
+            eprintln!();
+            eprintln!("commands:");
+            eprintln!("  index   Index dependencies for this project");
+            eprintln!("  search  Semantic search across indexed deps");
+            eprintln!("  stats   Show index statistics");
+            std::process::exit(1);
+        }
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (norm_a * norm_b)
+fn cmd_index(project: &project::RustProject) {
+    println!("Indexing dependencies for: {}", project.name);
+    println!("Found {} dependencies in Cargo.lock", project.deps.len());
+
+    let db = db::Database::open().expect("Failed to open database");
+    let mut embedder = embed::Embedder::new().expect("Failed to load embedding model");
+
+    let mut indexed = 0;
+    let mut skipped = 0;
+
+    for dep in &project.deps {
+        if db.is_indexed(&dep.name, &dep.version).unwrap_or(false) {
+            skipped += 1;
+            continue;
+        }
+
+        print!("  {}@{} ... ", dep.name, dep.version);
+
+        // TODO: Actually parse the crate and extract symbols
+        // For now, just index the crate name as a placeholder
+        let symbols = vec![db::Symbol {
+            path: format!("{}::lib", dep.name),
+            kind: "module".to_string(),
+            signature: None,
+        }];
+
+        // Generate embeddings for symbols
+        let texts: Vec<String> = symbols.iter().map(|s| s.path.clone()).collect();
+        let embeddings = embedder.embed(&texts).expect("Embedding failed");
+
+        db.index_crate(&dep.name, &dep.version, &symbols, &embeddings)
+            .expect("Failed to index crate");
+
+        println!("{} symbols", symbols.len());
+        indexed += 1;
+    }
+
+    println!();
+    println!("Done: {indexed} indexed, {skipped} already cached");
+}
+
+fn cmd_search(project: &project::RustProject, query: &str) {
+    let db = db::Database::open().expect("Failed to open database");
+    let mut embedder = embed::Embedder::new().expect("Failed to load embedding model");
+
+    // Get crate IDs for this project's deps
+    let crate_ids: Vec<i64> = project
+        .deps
+        .iter()
+        .filter_map(|dep| db.get_crate_id(&dep.name, &dep.version).ok().flatten())
+        .collect();
+
+    if crate_ids.is_empty() {
+        eprintln!("No indexed dependencies. Run `cratefind index` first.");
+        std::process::exit(1);
+    }
+
+    // Embed query
+    let query_embedding = embedder
+        .embed(&[query.to_string()])
+        .expect("Embedding failed");
+    let query_vec = &query_embedding[0];
+
+    // Search
+    let results = db.search(query_vec, &crate_ids, 10).expect("Search failed");
+
+    if results.is_empty() {
+        println!("No results for: {query}");
+        return;
+    }
+
+    println!("Results for: {query}\n");
+    for (i, result) in results.iter().enumerate() {
+        println!(
+            "{}. {} ({}) [{:.2}]",
+            i + 1,
+            result.path,
+            result.kind,
+            result.score
+        );
+        if let Some(sig) = &result.signature {
+            println!("   {sig}");
+        }
+    }
+}
+
+fn cmd_stats(project: &project::RustProject) {
+    let db = db::Database::open().expect("Failed to open database");
+    let stats = db.stats().expect("Failed to get stats");
+
+    println!("Global index: {}", db::Database::path().display());
+    println!("  {} crates indexed", stats.crate_count);
+    println!("  {} symbols", stats.symbol_count);
+    println!("  {:.1} MB", stats.db_size_bytes as f64 / 1_000_000.0);
+    println!();
+    println!("Project: {}", project.name);
+    println!("  {} dependencies", project.deps.len());
+
+    let indexed: usize = project
+        .deps
+        .iter()
+        .filter(|d| db.is_indexed(&d.name, &d.version).unwrap_or(false))
+        .count();
+    println!("  {} indexed", indexed);
 }
