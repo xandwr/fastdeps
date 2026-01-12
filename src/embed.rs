@@ -10,6 +10,7 @@ pub struct Embedder {
     model: TextEmbedding,
 }
 
+#[allow(dead_code)]
 impl Embedder {
     pub fn new() -> Result<Self, anyhow::Error> {
         #[cfg(target_arch = "aarch64")]

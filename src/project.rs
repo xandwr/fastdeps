@@ -11,6 +11,7 @@ pub struct Dependency {
 
 /// A discovered Rust project
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct RustProject {
     pub root: PathBuf,
     pub name: String,

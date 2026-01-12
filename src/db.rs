@@ -17,6 +17,7 @@ pub struct Symbol {
 
 /// A search result
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SearchResult {
     pub crate_name: String,
     pub crate_version: String,
