@@ -1,4 +1,4 @@
-use cratefind::{db, embed, octo_index, parse, profile, project, usage};
+use cratefind::{contrastive, db, embed, octo_index, parse, profile, project, usage};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -75,6 +75,22 @@ fn main() {
             // Lookup a crate in the Octo-Index
             cmd_octo_lookup(&args[2..]);
         }
+        Some("train-mapper") => {
+            // Train the contrastive mapper (384D → 8D)
+            cmd_train_mapper(&args[2..]);
+        }
+        Some("semantic-search") => {
+            // Natural language search using trained mapper
+            let query = args[2..].join(" ");
+            if query.is_empty() {
+                eprintln!("usage: cratefind semantic-search <natural language query>");
+                eprintln!(
+                    "example: cratefind semantic-search \"async http client with connection pooling\""
+                );
+                std::process::exit(1);
+            }
+            cmd_semantic_search(&query, &args[2..]);
+        }
         _ => {
             eprintln!("cratefind - Understand your Rust dependencies like a senior engineer");
             eprintln!();
@@ -94,6 +110,12 @@ fn main() {
             eprintln!("                   Search top crates using pre-built octonion index");
             eprintln!("  octo-lookup <crate> [--file <path>]");
             eprintln!("                   Look up a crate's octonion profile");
+            eprintln!();
+            eprintln!("CONTRASTIVE MAPPING (384D → 8D):");
+            eprintln!("  train-mapper --octo-index <path> [-o <output>]");
+            eprintln!("                   Train a 384×8 linear mapper from crate descriptions");
+            eprintln!("  semantic-search <query> --mapper <path> --octo-index <path>");
+            eprintln!("                   Natural language search using trained mapper");
             eprintln!();
             eprintln!("EXAMPLES:");
             eprintln!("  cratefind index");
@@ -816,5 +838,285 @@ fn cmd_octo_lookup(args: &[String]) {
             }
             std::process::exit(1);
         }
+    }
+}
+
+fn cmd_train_mapper(args: &[String]) {
+    let mut octo_index_path: Option<String> = None;
+    let mut output_path = "contrastive-mapper.bin".to_string();
+    let mut epochs = 1000;
+    let mut learning_rate = 0.5;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--octo-index" | "-i" => {
+                if i + 1 < args.len() {
+                    octo_index_path = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "-o" | "--output" => {
+                if i + 1 < args.len() {
+                    output_path = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--epochs" => {
+                if i + 1 < args.len() {
+                    epochs = args[i + 1].parse().unwrap_or(1000);
+                    i += 1;
+                }
+            }
+            "--lr" => {
+                if i + 1 < args.len() {
+                    learning_rate = args[i + 1].parse().unwrap_or(0.5);
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let octo_index_path = match octo_index_path {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: cratefind train-mapper --octo-index <path> [-o <output>]");
+            eprintln!();
+            eprintln!("Options:");
+            eprintln!("  --octo-index <path>  Path to the Octo-Index file (required)");
+            eprintln!(
+                "  -o <path>            Output path for the mapper (default: contrastive-mapper.bin)"
+            );
+            eprintln!("  --epochs <n>         Number of training epochs (default: 1000)");
+            eprintln!("  --lr <rate>          Learning rate (default: 0.5)");
+            std::process::exit(1);
+        }
+    };
+
+    // Load the Octo-Index
+    println!("Loading Octo-Index from {} ...", octo_index_path);
+    let index = match octo_index::OctoIndex::load(std::path::Path::new(&octo_index_path)) {
+        Ok(idx) => idx,
+        Err(e) => {
+            eprintln!("Failed to load Octo-Index: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("  {} crates loaded", index.count);
+
+    // Initialize embedder
+    println!("Loading embedding model ...");
+    let mut embedder = embed::Embedder::new().expect("Failed to load embedding model");
+
+    // Prepare training data: embed crate descriptions
+    println!("Generating embeddings for crate descriptions ...");
+    let profiles: Vec<_> = index.profiles.values().collect();
+
+    // Create description texts (crate name + metadata hints)
+    let descriptions: Vec<String> = profiles
+        .iter()
+        .map(|p| {
+            // Create a rich description from the profile
+            let mut desc = format!("{} - Rust crate", p.name);
+
+            // Add semantic hints based on octonion coefficients
+            if p.coeffs[3] > 0.3 {
+                desc.push_str(" async asynchronous");
+            }
+            if p.coeffs[1] > 0.3 {
+                desc.push_str(" thread-safe Send Sync concurrent");
+            }
+            if p.coeffs[6] > 0.5 {
+                desc.push_str(" no_std embedded bare-metal");
+            }
+            if p.coeffs[2] < 0.1 {
+                desc.push_str(" safe memory-safe");
+            }
+            if p.coeffs[5] < 0.2 {
+                desc.push_str(" lightweight minimal zero-dependency");
+            }
+
+            desc
+        })
+        .collect();
+
+    // Batch embed
+    let batch_size = 64;
+    let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(profiles.len());
+
+    for (batch_idx, batch) in descriptions.chunks(batch_size).enumerate() {
+        let batch_strings: Vec<String> = batch.to_vec();
+        match embedder.embed(&batch_strings) {
+            Ok(embs) => {
+                all_embeddings.extend(embs);
+                print!(
+                    "\r  Embedded {}/{} crates",
+                    (batch_idx + 1) * batch_size.min(batch.len()),
+                    profiles.len()
+                );
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+            }
+            Err(e) => {
+                eprintln!("\nFailed to embed batch: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    println!();
+
+    // Extract targets (8D coefficients)
+    let targets: Vec<[f32; 8]> = profiles.iter().map(|p| p.coeffs).collect();
+
+    // Train the mapper
+    println!(
+        "Training contrastive mapper (epochs={}, lr={}) ...",
+        epochs, learning_rate
+    );
+    let mut mapper = contrastive::ContrastiveMapper::new_random();
+
+    let initial_loss = mapper.compute_loss(&all_embeddings, &targets);
+    println!("  Initial loss: {:.6}", initial_loss);
+
+    let final_loss = mapper.train(&all_embeddings, &targets, learning_rate, epochs, true);
+
+    println!("  Final loss: {:.6}", final_loss);
+    println!(
+        "  Improvement: {:.1}%",
+        (1.0 - final_loss / initial_loss) * 100.0
+    );
+
+    // Save the mapper
+    let output_path = std::path::Path::new(&output_path);
+    mapper.save(output_path).expect("Failed to save mapper");
+
+    let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    println!();
+    println!(
+        "Saved mapper to {} ({} bytes)",
+        output_path.display(),
+        file_size
+    );
+    println!();
+
+    // Test a few predictions
+    println!("Sample predictions:");
+    for p in profiles.iter().take(5) {
+        let idx = profiles.iter().position(|x| x.name == p.name).unwrap();
+        let pred = mapper.forward(&all_embeddings[idx]);
+        println!("  {}: target={:?}", p.name, &p.coeffs[..4]);
+        println!("       pred  ={:?}", &pred[..4]);
+    }
+}
+
+fn cmd_semantic_search(query: &str, args: &[String]) {
+    let mut octo_index_path: Option<String> = None;
+    let mut mapper_path: Option<String> = None;
+    let mut limit = 10;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--octo-index" | "-i" => {
+                if i + 1 < args.len() {
+                    octo_index_path = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--mapper" | "-m" => {
+                if i + 1 < args.len() {
+                    mapper_path = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "-n" | "--limit" => {
+                if i + 1 < args.len() {
+                    limit = args[i + 1].parse().unwrap_or(10);
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let octo_index_path = match octo_index_path {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "usage: cratefind semantic-search <query> --mapper <path> --octo-index <path>"
+            );
+            eprintln!();
+            eprintln!("Options:");
+            eprintln!("  --octo-index <path>  Path to the Octo-Index file (required)");
+            eprintln!("  --mapper <path>      Path to the trained mapper (required)");
+            eprintln!("  -n <limit>           Number of results (default: 10)");
+            std::process::exit(1);
+        }
+    };
+
+    let mapper_path = match mapper_path {
+        Some(p) => p,
+        None => {
+            eprintln!("No mapper file specified. Use --mapper <path>");
+            std::process::exit(1);
+        }
+    };
+
+    // Load mapper
+    let mapper = match contrastive::ContrastiveMapper::load(std::path::Path::new(&mapper_path)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to load mapper: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Load index
+    let index = match octo_index::OctoIndex::load(std::path::Path::new(&octo_index_path)) {
+        Ok(idx) => idx,
+        Err(e) => {
+            eprintln!("Failed to load Octo-Index: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Embed query
+    let mut embedder = embed::Embedder::new().expect("Failed to load embedding model");
+    let query_embedding = embedder.embed_one(query).expect("Failed to embed query");
+
+    // Project to 8D
+    let query_8d = mapper.forward(&query_embedding);
+
+    println!("Query: \"{}\"", query);
+    println!();
+    println!("Projected to 8D:");
+    println!(
+        "  e0={:.2} e1={:.2} e2={:.2} e3={:.2} e4={:.2} e5={:.2} e6={:.2} e7={:.2}",
+        query_8d[0],
+        query_8d[1],
+        query_8d[2],
+        query_8d[3],
+        query_8d[4],
+        query_8d[5],
+        query_8d[6],
+        query_8d[7]
+    );
+    println!();
+
+    // Search using the projected query
+    let results = index.search(&query_8d, limit);
+
+    println!("Top {} results from {} crates:", limit, index.count);
+    println!("{:<30} {:>10} {:>8}", "CRATE", "VERSION", "SCORE");
+    println!("{}", "-".repeat(52));
+
+    for (profile, score) in results {
+        println!(
+            "{:<30} {:>10} {:>8.3}",
+            profile.name, profile.version, score
+        );
     }
 }
